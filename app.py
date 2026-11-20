@@ -1,24 +1,28 @@
 """
 app.py
-F1 / Endurance Pit-Wall Strategy Simulator (v2.2 — 2026 Season FastF1 Telemetry Edition)
+F1 / Endurance Pit-Wall Strategy Simulator (v2.3 — 2026 Season FastF1 & Real Race Results Edition)
 
 Interactive Streamlit + Plotly pit-wall command center featuring:
 - All 23 circuits of the 2026 FIA Formula 1 World Championship calibrated via FastF1
 - Exact Backward Dynamic Programming (Bellman optimality) solver enforcing the 2-compound rule
 - Interactive Custom Pit-Wall Strategy Builder with FIA 2-compound rule validation & DP delta benchmarking
+- Real Grand Prix Result Strategy loader (P1–P20 actual FastF1 driver pit strategies vs. DP optimum)
 - Live mid-race chaos controls (Safety Car deployment, Rival Undercut, Passing Rain Cell)
 - Monte Carlo stochastic race rollout engine with P10–P90 confidence fan chart
 - Circuit-specific empirical tire compound degradation & thermal cliff curves
 """
 
+import os
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from engine.optimizer import (
+    build_actual_driver_plan,
     build_custom_strategy_plan,
     generate_standard_rival_strategies,
+    load_actual_strategies,
     run_monte_carlo_evaluation,
     solve_optimal_strategy_dp,
 )
@@ -69,12 +73,22 @@ st.markdown(
 )
 
 
+def _file_mtime(path: str) -> float:
+    return os.path.getmtime(path) if os.path.exists(path) else 0.0
+
+
 @st.cache_data
-def get_all_circuits():
+def get_all_circuits(_mtime: float):
     return load_circuits()
 
 
-circuits = get_all_circuits()
+@st.cache_data
+def get_all_actual_strategies(_mtime: float):
+    return load_actual_strategies()
+
+
+circuits = get_all_circuits(_file_mtime("data/circuits.json"))
+actual_strategies_by_circuit = get_all_actual_strategies(_file_mtime("data/actual_strategies.json"))
 sorted_keys = sorted(circuits.keys(), key=lambda k: (circuits[k].round, circuits[k].name))
 
 # --- SIDEBAR: PIT-WALL CONTROLS ---
@@ -87,6 +101,8 @@ selected_key = st.sidebar.selectbox(
     format_func=lambda k: f"R{circuits[k].round:02d} — {circuits[k].name} ({circuits[k].country})",
 )
 circuit = circuits[selected_key]
+circuit_actuals = actual_strategies_by_circuit.get(selected_key, {})
+actual_drivers = circuit_actuals.get("drivers", [])
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("⚙️ Solver & Monte Carlo Settings")
@@ -132,11 +148,17 @@ dp_result = solve_optimal_strategy_dp(
 )
 rival_strategies = generate_standard_rival_strategies(circuit)
 
-ctrl_col1, ctrl_col2 = st.columns([1, 1])
+mode_options = [
+    "🤖 Bellman DP Optimal (Auto)",
+    "🛠️ Custom Pit-Wall Strategy (Manual)",
+    "🏁 Real Grand Prix Result Strategy",
+]
+
+ctrl_col1, ctrl_col2 = st.columns([3, 2])
 with ctrl_col1:
     strategy_mode = st.radio(
         "Player Pit-Wall Strategy Mode",
-        options=["🤖 Bellman DP Optimal (Auto)", "🛠️ Custom Pit-Wall Strategy (Manual)"],
+        options=mode_options,
         horizontal=True,
     )
 with ctrl_col2:
@@ -147,8 +169,9 @@ with ctrl_col2:
     )
 rival_plan = rival_strategies[rival_idx]
 
-# --- CUSTOM STRATEGY BUILDER PANEL ---
+# --- CUSTOM OR REAL GRAND PRIX STRATEGY PANEL ---
 custom_result = None
+selected_actual_driver = None
 base_player_plan = dp_result.plan
 
 if strategy_mode == "🛠️ Custom Pit-Wall Strategy (Manual)":
@@ -217,6 +240,39 @@ if strategy_mode == "🛠️ Custom Pit-Wall Strategy (Manual)":
             for w in custom_result.warnings:
                 st.warning(f"⚠️ {w}")
 
+elif strategy_mode == "🏁 Real Grand Prix Result Strategy":
+    with st.expander("🏁 Real Grand Prix Classification & Pit-Wall Stints (FastF1)", expanded=True):
+        if actual_drivers:
+            drv_idx = st.selectbox(
+                f"Select Driver Classification ({circuit_actuals.get('source', 'FastF1 Race')})",
+                options=list(range(len(actual_drivers))),
+                format_func=lambda i: actual_drivers[i].display_label,
+                key=f"actual_drv_{selected_key}",
+            )
+            selected_actual_driver = actual_drivers[drv_idx]
+            custom_result = build_actual_driver_plan(
+                circuit=circuit,
+                driver_strategy=selected_actual_driver,
+                driver_pace_offset_sec=driver_pace_offset,
+            )
+            base_player_plan = custom_result.plan
+
+            m1, m2, m3, m4 = st.columns(4)
+            pos_str = f"P{selected_actual_driver.position}" if selected_actual_driver.position < 90 else "DNF"
+            grid_str = f"P{selected_actual_driver.grid_position}" if selected_actual_driver.grid_position > 0 else "Pit/NA"
+            m1.metric("Driver & Team", f"{selected_actual_driver.driver_name}", f"{selected_actual_driver.team}")
+            m2.metric("Finish / Grid", f"{pos_str} (Started {grid_str})", selected_actual_driver.status)
+            m3.metric("Laps Completed", f"{selected_actual_driver.laps_completed} / {circuit.total_laps}")
+            m4.metric("Executed Pit Stops", f"{selected_actual_driver.num_stops} Stop(s)", selected_actual_driver.strategy_summary)
+
+            for w in custom_result.warnings:
+                st.info(f"ℹ️ {w}")
+        else:
+            st.warning(
+                "No real race classification is cached for this round yet. "
+                "Run `python data/calibrate_fastf1.py` after the Grand Prix completes."
+            )
+
 # --- APPLY LIVE CHAOS SCENARIO ---
 sc_laps = list(range(chaos_lap, min(circuit.total_laps + 1, chaos_lap + 4))) if inject_sc else []
 wetness_profile = [0.0] * circuit.total_laps
@@ -283,7 +339,7 @@ det_trace = simulate_race_trace(
     wetness_by_lap=wetness_profile,
 )
 
-# Also compute clean dry baseline time for custom plan so we can benchmark directly vs. DP Optimal
+# Clean dry baseline time for custom/actual plan so we can benchmark directly vs. DP Optimal
 clean_player_trace = simulate_race_trace(
     circuit=circuit,
     player_plan=base_player_plan,
@@ -309,7 +365,8 @@ clean_plan_label = (
     .replace("Live Re-Opt SC: ", "")
     .replace("Custom: ", "Custom | ")
 )
-if strategy_mode == "🛠️ Custom Pit-Wall Strategy (Manual)":
+is_benchmark_mode = strategy_mode in ("🛠️ Custom Pit-Wall Strategy (Manual)", "🏁 Real Grand Prix Result Strategy")
+if is_benchmark_mode:
     k1_delta = f"{delta_vs_dp_sec:+.2f}s vs. DP Optimal"
 else:
     k1_delta = "SC Re-Optimized" if inject_sc else "Bellman Global Optimum"
@@ -318,7 +375,7 @@ k1.metric(
     label="Active Pit-Wall Strategy",
     value=clean_plan_label,
     delta=k1_delta,
-    delta_color="inverse" if (strategy_mode.startswith("🛠️") and delta_vs_dp_sec > 0.05) else "normal",
+    delta_color="inverse" if (is_benchmark_mode and delta_vs_dp_sec > 0.05) else "normal",
 )
 k2.metric(
     label="Projected Race Time",
@@ -420,13 +477,40 @@ with col_right:
     )
     st.plotly_chart(fig_tire, use_container_width=True)
 
-# --- ROW 2: DP STRATEGY LEADERBOARD (+ CUSTOM BENCHMARK) ---
-st.subheader("🏆 Strategy Leaderboard & Custom Benchmark (Dry Baseline)")
+# --- ROW 2: DP STRATEGY LEADERBOARD (+ CUSTOM & REAL PODIUM BENCHMARKS) ---
+st.subheader("🏆 Strategy Leaderboard: DP Optimum vs. Real Grand Prix Podium")
 
 all_entries = [(label, total_sec, plan, "DP Optimal") for label, total_sec, plan in dp_result.top_alternatives]
-if custom_result is not None:
+
+# Add Custom Strategy if in Custom mode
+if strategy_mode == "🛠️ Custom Pit-Wall Strategy (Manual)" and custom_result is not None:
     legal_tag = "Custom Strategy" if custom_result.is_fia_legal_dry else "Custom (⚠️ FIA 1-Comp)"
     all_entries.append((custom_result.stint_summary, clean_player_time_sec, custom_result.plan, legal_tag))
+
+# Automatically benchmark real Grand Prix Podium (P1, P2, P3) + currently selected real driver
+included_driver_codes = set()
+podium_candidates = [d for d in actual_drivers if d.position in (1, 2, 3) and d.laps_completed >= int(circuit.total_laps * 0.85)]
+if selected_actual_driver is not None and selected_actual_driver.driver_code not in {d.driver_code for d in podium_candidates}:
+    podium_candidates.append(selected_actual_driver)
+
+for drv in podium_candidates:
+    if drv.driver_code in included_driver_codes:
+        continue
+    included_driver_codes.add(drv.driver_code)
+    drv_res = build_actual_driver_plan(
+        circuit=circuit,
+        driver_strategy=drv,
+        driver_pace_offset_sec=driver_pace_offset,
+    )
+    drv_trace = simulate_race_trace(
+        circuit=circuit,
+        player_plan=drv_res.plan,
+        rival_plan=rival_plan,
+    )
+    drv_time_sec = float(drv_trace["player_cum_time"][-1])
+    pos_badge = f"P{drv.position}" if drv.position < 90 else "DNF"
+    source_label = f"Real {pos_badge} ({drv.driver_code} • {drv.team})"
+    all_entries.append((drv_res.stint_summary, drv_time_sec, drv_res.plan, source_label))
 
 all_entries.sort(key=lambda item: item[1])
 fastest_time_sec = all_entries[0][1]
@@ -440,8 +524,8 @@ for rank, (label, total_sec, plan, source_tag) in enumerate(all_entries, start=1
             "Source": source_tag,
             "Starting Compound": COMPOUNDS[plan.start_compound].name,
             "Strategy Sequence": label,
-            "Total Race Time (s)": f"{total_sec:.2f}s",
-            "Delta vs. Optimal": "+0.00s" if abs(delta_best) < 1e-3 else f"+{delta_best:.2f}s",
+            "Simulated Race Time (s)": f"{total_sec:.2f}s",
+            "Delta vs. Fastest": "+0.00s" if abs(delta_best) < 1e-3 else f"+{delta_best:.2f}s",
         }
     )
 

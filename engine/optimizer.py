@@ -7,14 +7,16 @@ Combines:
    dry-weather pit window and compound sequence (enforcing the 2-compound FIA rule).
 2. Mid-Race Re-Solver: dynamically recomputes optimal remaining stints from any live
    race state (e.g., reacting instantaneously to a Safety Car or Rival Undercut).
-3. Custom Strategy Builder & Validator: constructs and validates user-defined pit-wall
-   strategies against FIA sporting regulations (2-compound rule & valid pit windows).
+3. Custom & Actual Race Strategy Builder: constructs and validates user-defined or
+   historical Grand Prix driver strategies against FIA sporting regulations.
 4. Monte Carlo Rollout Engine: stress-tests candidate strategies across hundreds of
    stochastic race futures (random Safety Cars, rain showers, and lap-time variance).
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from engine.physics import (
@@ -48,11 +50,99 @@ class DPOptimalResult:
 
 @dataclass
 class CustomStrategyResult:
-    """Validated user-constructed pit-wall strategy plan."""
+    """Validated user-constructed or real-world pit-wall strategy plan."""
     plan: CarStrategyPlan
     stint_summary: str
     is_fia_legal_dry: bool
     warnings: List[str]
+
+
+@dataclass
+class ActualDriverStrategy:
+    """Real Grand Prix driver classification and stint sequence extracted from FastF1."""
+    position: int
+    grid_position: int
+    driver_code: str
+    driver_name: str
+    team: str
+    status: str
+    laps_completed: int
+    num_stops: int
+    start_compound: str
+    stops: List[Tuple[int, str]]
+    stint_sequence: List[str]
+    strategy_summary: str
+    is_dry_only: bool
+
+    @property
+    def display_label(self) -> str:
+        pos_tag = f"P{self.position}" if self.position < 90 else "DNF"
+        return f"{pos_tag} {self.driver_code} ({self.team}) — {self.strategy_summary}"
+
+
+def _canonicalize_compound_key(raw: str) -> str:
+    """Map FastF1 compound labels ('INTERMEDIATE') to physics engine keys ('INTER')."""
+    c = str(raw or "").strip().upper()
+    if c in ("INTERMEDIATE", "INTER"):
+        return "INTER"
+    if c in COMPOUNDS:
+        return c
+    return "MEDIUM"
+
+
+def load_actual_strategies(
+    filepath: str = "data/actual_strategies.json",
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Load extracted Grand Prix driver strategies from JSON.
+    Returns a dict keyed by circuit_key containing 'source', 'total_laps', and
+    'drivers' (List[ActualDriverStrategy]).
+    """
+    path = Path(filepath)
+    if not path.exists():
+        return {}
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except Exception:
+        return {}
+
+    parsed: Dict[str, Dict[str, Any]] = {}
+    for circuit_key, entry in raw_data.items():
+        driver_objs: List[ActualDriverStrategy] = []
+        for d in entry.get("drivers", []):
+            start_c = _canonicalize_compound_key(d.get("start_compound", "MEDIUM"))
+            pit_laps = d.get("pit_laps", [])
+            next_comps = [_canonicalize_compound_key(c) for c in d.get("compounds", [])]
+            stops = list(zip([int(l) for l in pit_laps], next_comps))
+            stint_seq = [_canonicalize_compound_key(c) for c in d.get("stint_sequence", [start_c])]
+
+            driver_objs.append(
+                ActualDriverStrategy(
+                    position=int(d.get("position", 99)),
+                    grid_position=int(d.get("grid_position", 0)),
+                    driver_code=str(d.get("driver_code", "DRV")),
+                    driver_name=str(d.get("driver_name", "Driver")),
+                    team=str(d.get("team", "Team")),
+                    status=str(d.get("status", "Finished")),
+                    laps_completed=int(d.get("laps_completed", entry.get("total_laps", 50))),
+                    num_stops=len(stops),
+                    start_compound=start_c,
+                    stops=stops,
+                    stint_sequence=stint_seq,
+                    strategy_summary=str(d.get("strategy_summary", "")),
+                    is_dry_only=bool(d.get("is_dry_only", True)),
+                )
+            )
+
+        parsed[circuit_key] = {
+            "source": str(entry.get("source", "FastF1")),
+            "total_laps": int(entry.get("total_laps", 50)),
+            "drivers": driver_objs,
+        }
+
+    return parsed
 
 
 def build_custom_strategy_plan(
@@ -60,15 +150,17 @@ def build_custom_strategy_plan(
     start_compound: str,
     stops: List[Tuple[int, str]],
     driver_pace_offset_sec: float = 0.0,
+    plan_prefix: str = "Custom",
 ) -> CustomStrategyResult:
     """
-    Construct and validate a custom user-defined pit-wall strategy.
+    Construct and validate a custom user-defined or historical pit-wall strategy.
 
     Args:
         circuit: Active Grand Prix circuit configuration.
         start_compound: Starting tire compound key (e.g., "SOFT", "MEDIUM", "HARD").
         stops: List of (pit_lap, next_compound) tuples.
         driver_pace_offset_sec: Driver/car pace delta vs. rival (s/lap).
+        plan_prefix: Label prefix for the CarStrategyPlan (e.g., "Custom" or "P1 NOR").
 
     Returns:
         CustomStrategyResult containing the executable CarStrategyPlan, formatted
@@ -77,6 +169,7 @@ def build_custom_strategy_plan(
     warnings: List[str] = []
     n_laps = circuit.total_laps
 
+    start_compound = _canonicalize_compound_key(start_compound)
     if start_compound not in COMPOUNDS:
         start_compound = "MEDIUM"
         warnings.append("Invalid starting compound defaulted to MEDIUM.")
@@ -92,13 +185,14 @@ def build_custom_strategy_plan(
             warnings.append(f"Duplicate pit stop on Lap {clamped_lap} merged (last compound kept).")
         seen_laps.add(clamped_lap)
 
-        valid_comp = comp if comp in COMPOUNDS else "HARD"
+        valid_comp = _canonicalize_compound_key(comp)
         cleaned_stops[clamped_lap] = valid_comp
 
     # Check FIA Sporting Regulation: at least 2 distinct dry compounds required in a dry race
     compounds_used = [start_compound] + [cleaned_stops[l] for l in sorted(cleaned_stops)]
     distinct_dry_used = {c for c in compounds_used if c in DRY_COMPOUNDS}
-    is_fia_legal_dry = len(distinct_dry_used) >= 2
+    has_wet_compound = any(c in ("INTER", "WET") for c in compounds_used)
+    is_fia_legal_dry = (len(distinct_dry_used) >= 2) or has_wet_compound
 
     if not is_fia_legal_dry:
         warnings.append(
@@ -113,7 +207,7 @@ def build_custom_strategy_plan(
         stint_label += f" [{laps_str}]"
 
     plan = CarStrategyPlan(
-        name=f"Custom: {stint_label}",
+        name=f"{plan_prefix}: {stint_label}",
         start_compound=start_compound,
         pit_stops=cleaned_stops,
         driver_pace_offset_sec=driver_pace_offset_sec,
@@ -124,6 +218,26 @@ def build_custom_strategy_plan(
         stint_summary=stint_label,
         is_fia_legal_dry=is_fia_legal_dry,
         warnings=warnings,
+    )
+
+
+def build_actual_driver_plan(
+    circuit: Circuit,
+    driver_strategy: ActualDriverStrategy,
+    driver_pace_offset_sec: float = 0.0,
+) -> CustomStrategyResult:
+    """
+    Convert a real Grand Prix driver's FastF1 stint history into a validated
+    CarStrategyPlan for head-to-head simulation and DP benchmarking.
+    """
+    pos_tag = f"P{driver_strategy.position}" if driver_strategy.position < 90 else "DNF"
+    prefix = f"{pos_tag} {driver_strategy.driver_code}"
+    return build_custom_strategy_plan(
+        circuit=circuit,
+        start_compound=driver_strategy.start_compound,
+        stops=driver_strategy.stops,
+        driver_pace_offset_sec=driver_pace_offset_sec,
+        plan_prefix=prefix,
     )
 
 
@@ -516,14 +630,18 @@ if __name__ == "__main__":
     from engine.physics import load_circuits
 
     circuits = load_circuits()
+    actuals = load_actual_strategies()
     for key in ("monza", "silverstone", "monaco"):
         c = circuits[key]
         dp_res = solve_optimal_strategy_dp(c)
         rivals = generate_standard_rival_strategies(c)
         mc = run_monte_carlo_evaluation(c, dp_res.plan, rivals[0], n_sims=250)
+        p1_info = ""
+        if key in actuals and actuals[key]["drivers"]:
+            p1 = actuals[key]["drivers"][0]
+            p1_info = f" | Real P1: {p1.driver_code} {p1.strategy_summary}"
         print(
             f"[{c.name}] DP Optimal: {dp_res.stint_summary} "
             f"| Est. Time: {dp_res.expected_total_time_sec:.2f}s "
-            f"| Win Prob vs {rivals[0].name}: {mc.win_probability_pct:.1f}% "
-            f"(Mean Gap: {mc.mean_final_gap_sec:+.2f}s)"
+            f"| Win Prob vs {rivals[0].name}: {mc.win_probability_pct:.1f}%{p1_info}"
         )

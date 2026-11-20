@@ -1,13 +1,14 @@
 """
 data/calibrate_fastf1.py
-Crash-proof FastF1 + OpenF1 Telemetry Calibration Pipeline for the 2026 F1 Season (All 23 Circuits).
+Crash-proof OpenF1 + FastF1 Telemetry & Actual Race Strategy Calibration Pipeline
+for the 2026 F1 Season (All 23 Circuits).
 
 Features:
-- Subprocess isolation per Grand Prix so C-extension / OpenMP quirks on macOS can never crash the pipeline
-- Primary source: FastF1 Race ('R') telemetry (2026 completed rounds R01-R20, 2025 baseline for R21-R23)
-- Secondary live fallback: OpenF1 / Jolpica REST telemetry if FastF1 parser fails
+- Pure-Python OpenF1 REST client with circuit_short_name matching, official /session_result
+  classification, /stints tire compound extraction, and HTTP 429 rate-limit backoff
 - Calibrates total_laps, fuel-corrected base_lap_time_sec, empirical pit_loss_sec,
   safety_car_prob_per_lap, and per-compound degradation curves (SOFT, MEDIUM, HARD)
+- Exports data/circuits.json, data/compound_profiles.json, and data/actual_strategies.json
 
 Usage:
     source venv/bin/activate
@@ -17,9 +18,14 @@ Usage:
 import json
 import os
 from pathlib import Path
+import ssl
 import subprocess
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.error import HTTPError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 import warnings
 
 # Prevent macOS OpenMP / Accelerate / OpenBLAS thread-pool segfaults
@@ -34,6 +40,9 @@ warnings.filterwarnings("ignore")
 CACHE_DIR = Path("data/fastf1_cache")
 CIRCUITS_OUT = Path("data/circuits.json")
 COMPOUNDS_OUT = Path("data/compound_profiles.json")
+STRATEGIES_OUT = Path("data/actual_strategies.json")
+
+OPENF1_BASE = "https://api.openf1.org/v1"
 
 # Complete 2026 FIA Formula One World Championship Calendar (23 Circuits)
 CALENDAR_2026: Dict[str, Dict[str, Any]] = {
@@ -41,7 +50,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 1,
         "name": "Albert Park Grand Prix Circuit",
         "country": "Australia",
-        "fastf1_queries": [(2026, "Australia"), (2025, "Australia")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Melbourne"),
+            (2025, "circuit_short_name", "Melbourne"),
+        ],
         "total_laps": 58,
         "base_lap_time_sec": 79.8,
         "pit_loss_sec": 20.4,
@@ -58,7 +70,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 2,
         "name": "Shanghai International Circuit",
         "country": "China",
-        "fastf1_queries": [(2026, "China"), (2025, "China")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Shanghai"),
+            (2025, "circuit_short_name", "Shanghai"),
+        ],
         "total_laps": 56,
         "base_lap_time_sec": 95.4,
         "pit_loss_sec": 22.6,
@@ -75,7 +90,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 3,
         "name": "Suzuka International Racing Course",
         "country": "Japan",
-        "fastf1_queries": [(2026, "Japan"), (2025, "Japan")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Suzuka"),
+            (2025, "circuit_short_name", "Suzuka"),
+        ],
         "total_laps": 53,
         "base_lap_time_sec": 91.2,
         "pit_loss_sec": 22.8,
@@ -92,7 +110,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 4,
         "name": "Miami International Autodrome",
         "country": "United States",
-        "fastf1_queries": [(2026, "Miami"), (2025, "Miami")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Miami"),
+            (2025, "circuit_short_name", "Miami"),
+        ],
         "total_laps": 57,
         "base_lap_time_sec": 90.1,
         "pit_loss_sec": 20.8,
@@ -109,7 +130,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 5,
         "name": "Circuit Gilles Villeneuve",
         "country": "Canada",
-        "fastf1_queries": [(2026, "Canada"), (2025, "Canada")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Montreal"),
+            (2025, "circuit_short_name", "Montreal"),
+        ],
         "total_laps": 70,
         "base_lap_time_sec": 74.6,
         "pit_loss_sec": 19.2,
@@ -126,7 +150,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 6,
         "name": "Circuit de Monaco",
         "country": "Monaco",
-        "fastf1_queries": [(2026, "Monaco"), (2025, "Monaco")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Monte Carlo"),
+            (2025, "circuit_short_name", "Monte Carlo"),
+        ],
         "total_laps": 78,
         "base_lap_time_sec": 74.2,
         "pit_loss_sec": 19.4,
@@ -143,7 +170,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 7,
         "name": "Circuit de Barcelona-Catalunya",
         "country": "Spain",
-        "fastf1_queries": [(2026, "Barcelona"), (2025, "Spain")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Catalunya"),
+            (2025, "circuit_short_name", "Catalunya"),
+        ],
         "total_laps": 66,
         "base_lap_time_sec": 76.8,
         "pit_loss_sec": 21.8,
@@ -160,7 +190,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 8,
         "name": "Red Bull Ring",
         "country": "Austria",
-        "fastf1_queries": [(2026, "Austria"), (2025, "Austria")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Spielberg"),
+            (2025, "circuit_short_name", "Spielberg"),
+        ],
         "total_laps": 71,
         "base_lap_time_sec": 67.8,
         "pit_loss_sec": 20.1,
@@ -177,7 +210,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 9,
         "name": "Silverstone Circuit",
         "country": "United Kingdom",
-        "fastf1_queries": [(2026, "Great Britain"), (2025, "Great Britain")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Silverstone"),
+            (2025, "circuit_short_name", "Silverstone"),
+        ],
         "total_laps": 52,
         "base_lap_time_sec": 89.2,
         "pit_loss_sec": 20.2,
@@ -194,7 +230,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 10,
         "name": "Circuit de Spa-Francorchamps",
         "country": "Belgium",
-        "fastf1_queries": [(2026, "Belgium"), (2025, "Belgium")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Spa-Francorchamps"),
+            (2025, "circuit_short_name", "Spa-Francorchamps"),
+        ],
         "total_laps": 44,
         "base_lap_time_sec": 106.2,
         "pit_loss_sec": 21.6,
@@ -211,7 +250,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 11,
         "name": "Hungaroring",
         "country": "Hungary",
-        "fastf1_queries": [(2026, "Hungary"), (2025, "Hungary")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Hungaroring"),
+            (2025, "circuit_short_name", "Hungaroring"),
+        ],
         "total_laps": 70,
         "base_lap_time_sec": 79.4,
         "pit_loss_sec": 20.8,
@@ -228,7 +270,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 12,
         "name": "Circuit Zandvoort",
         "country": "Netherlands",
-        "fastf1_queries": [(2026, "Netherlands"), (2025, "Netherlands")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Zandvoort"),
+            (2025, "circuit_short_name", "Zandvoort"),
+        ],
         "total_laps": 72,
         "base_lap_time_sec": 73.1,
         "pit_loss_sec": 19.6,
@@ -245,7 +290,11 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 13,
         "name": "Autodromo Nazionale Monza",
         "country": "Italy",
-        "fastf1_queries": [(2026, "Italy"), (2025, "Italy")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Monza"),
+            (2026, "country_name", "Italy"),
+            (2025, "country_name", "Italy"),
+        ],
         "total_laps": 53,
         "base_lap_time_sec": 82.1,
         "pit_loss_sec": 23.5,
@@ -262,7 +311,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 14,
         "name": "Madring (Circuito de Madrid)",
         "country": "Spain",
-        "fastf1_queries": [(2026, "Spain"), (2026, "Madrid")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Madrid"),
+            (2026, "country_name", "Spain"),
+        ],
         "total_laps": 55,
         "base_lap_time_sec": 93.4,
         "pit_loss_sec": 21.4,
@@ -279,7 +331,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 15,
         "name": "Baku City Circuit",
         "country": "Azerbaijan",
-        "fastf1_queries": [(2026, "Azerbaijan"), (2025, "Azerbaijan")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Baku"),
+            (2025, "circuit_short_name", "Baku"),
+        ],
         "total_laps": 51,
         "base_lap_time_sec": 104.2,
         "pit_loss_sec": 20.5,
@@ -296,7 +351,11 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 16,
         "name": "Sepang International Circuit (Bahrain GP)",
         "country": "Malaysia",
-        "fastf1_queries": [(2026, "Bahrain"), (2026, "Malaysia"), (2025, "Bahrain")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Sepang"),
+            (2026, "circuit_short_name", "Sakhir"),
+            (2025, "circuit_short_name", "Sakhir"),
+        ],
         "total_laps": 56,
         "base_lap_time_sec": 96.5,
         "pit_loss_sec": 22.5,
@@ -313,7 +372,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 17,
         "name": "Marina Bay Street Circuit",
         "country": "Singapore",
-        "fastf1_queries": [(2026, "Singapore"), (2025, "Singapore")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Singapore"),
+            (2025, "circuit_short_name", "Singapore"),
+        ],
         "total_laps": 62,
         "base_lap_time_sec": 95.8,
         "pit_loss_sec": 28.2,
@@ -330,7 +392,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 18,
         "name": "Circuit of The Americas",
         "country": "United States",
-        "fastf1_queries": [(2026, "United States"), (2025, "United States")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Austin"),
+            (2025, "circuit_short_name", "Austin"),
+        ],
         "total_laps": 56,
         "base_lap_time_sec": 96.2,
         "pit_loss_sec": 21.2,
@@ -347,7 +412,11 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 19,
         "name": "Autódromo Hermanos Rodríguez",
         "country": "Mexico",
-        "fastf1_queries": [(2026, "Mexico"), (2025, "Mexico")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Mexico City"),
+            (2026, "country_name", "Mexico"),
+            (2025, "country_name", "Mexico"),
+        ],
         "total_laps": 71,
         "base_lap_time_sec": 79.5,
         "pit_loss_sec": 22.0,
@@ -364,7 +433,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 20,
         "name": "Autódromo José Carlos Pace (Interlagos)",
         "country": "Brazil",
-        "fastf1_queries": [(2026, "Brazil"), (2026, "São Paulo"), (2025, "Brazil")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Interlagos"),
+            (2025, "circuit_short_name", "Interlagos"),
+        ],
         "total_laps": 71,
         "base_lap_time_sec": 72.8,
         "pit_loss_sec": 20.6,
@@ -381,7 +453,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 21,
         "name": "Las Vegas Strip Circuit",
         "country": "United States",
-        "fastf1_queries": [(2026, "Las Vegas"), (2025, "Las Vegas")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Las Vegas"),
+            (2025, "circuit_short_name", "Las Vegas"),
+        ],
         "total_laps": 50,
         "base_lap_time_sec": 94.5,
         "pit_loss_sec": 21.0,
@@ -398,7 +473,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 22,
         "name": "Lusail International Circuit",
         "country": "Qatar",
-        "fastf1_queries": [(2026, "Qatar"), (2025, "Qatar")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Lusail"),
+            (2025, "circuit_short_name", "Lusail"),
+        ],
         "total_laps": 57,
         "base_lap_time_sec": 84.2,
         "pit_loss_sec": 24.8,
@@ -415,7 +493,10 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
         "round": 23,
         "name": "Yas Marina Circuit",
         "country": "United Arab Emirates",
-        "fastf1_queries": [(2026, "Abu Dhabi"), (2025, "Abu Dhabi")],
+        "openf1_queries": [
+            (2026, "circuit_short_name", "Yas Marina Circuit"),
+            (2025, "circuit_short_name", "Yas Marina Circuit"),
+        ],
         "total_laps": 58,
         "base_lap_time_sec": 86.4,
         "pit_loss_sec": 21.5,
@@ -430,172 +511,275 @@ CALENDAR_2026: Dict[str, Dict[str, Any]] = {
     },
 }
 
+VALID_COMPOUNDS = {"SOFT", "MEDIUM", "HARD", "INTERMEDIATE", "WET"}
+DRY_COMPOUNDS = {"SOFT", "MEDIUM", "HARD"}
 
-def _worker_extract_single_circuit(circuit_key: str) -> None:
+
+def _normalize_compound(raw: Any) -> str:
+    """Normalize compound string to canonical simulator identifier."""
+    c = str(raw or "").strip().upper()
+    if c in ("INTER", "INTERMEDIATE"):
+        return "INTERMEDIATE"
+    if c in VALID_COMPOUNDS:
+        return c
+    return ""
+
+
+def _openf1_get(endpoint: str, params: Dict[str, Any], timeout: int = 15) -> List[Dict[str, Any]]:
     """
-    Executed inside an isolated child process for a single circuit key.
-    Prints a JSON payload prefixed with `__RESULT_JSON__:` to stdout.
+    Pure-Python HTTP GET helper for OpenF1 REST API with automatic HTTP 429 rate-limit backoff.
     """
-    import fastf1
-    import numpy as np
-    import pandas as pd
+    query_str = urlencode(params)
+    url = f"{OPENF1_BASE}/{endpoint}?{query_str}" if query_str else f"{OPENF1_BASE}/{endpoint}"
+    req = Request(url, headers={"User-Agent": "f1-pitwall-optimizer/2.3"})
+    ctx = ssl.create_default_context()
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    fastf1.Cache.enable_cache(str(CACHE_DIR))
-
-    prior = CALENDAR_2026[circuit_key]
-    session = None
-    source_label = None
-
-    for year, gp_name in prior["fastf1_queries"]:
+    for attempt in range(4):
         try:
-            sess = fastf1.get_session(year, gp_name, "R")
-            # Load only laps & weather (skip heavy telemetry/messages that trigger C-parser crashes)
-            sess.load(laps=True, telemetry=False, weather=False, messages=False)
-            if sess.laps is not None and len(sess.laps) > 50:
-                session = sess
-                source_label = f"{year} {sess.event['EventName']} (Race)"
-                break
+            time.sleep(0.42)  # Stay safely under OpenF1 3 req/sec free tier burst limit
+            with urlopen(req, timeout=timeout, context=ctx) as resp:
+                raw = resp.read().decode("utf-8")
+                data = json.loads(raw)
+                return data if isinstance(data, list) else []
+        except HTTPError as exc:
+            if exc.code == 429:
+                # Exponential backoff on rate limit
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return []
         except Exception:
+            time.sleep(0.5)
+    return []
+
+
+def _fetch_openf1_circuit_and_strategies(
+    cfg: Dict[str, Any],
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Dict[str, float]], Dict[str, Any]]]:
+    """
+    Pure-Python OpenF1 REST API extractor using `sessions`, `session_result`,
+    `drivers`, `stints`, and `laps`.
+    """
+    import numpy as np
+
+    selected_session = None
+    query_label = ""
+
+    for year, filter_field, filter_val in cfg.get("openf1_queries", []):
+        sessions = _openf1_get(
+            "sessions",
+            {"year": year, "session_name": "Race", filter_field: filter_val},
+        )
+        if sessions:
+            # Verify the session has stints (i.e., the Grand Prix has already taken place)
+            cand = sessions[-1]
+            stints_check = _openf1_get("stints", {"session_key": cand["session_key"]})
+            if stints_check:
+                selected_session = cand
+                stints_raw = stints_check
+                circuit_name = cand.get("circuit_short_name") or cand.get("country_name") or filter_val
+                query_label = f"{year} {circuit_name} GP (Race)"
+                break
+
+    if not selected_session:
+        return None
+
+    s_key = selected_session["session_key"]
+    drivers_raw = _openf1_get("drivers", {"session_key": s_key})
+    results_raw = _openf1_get("session_result", {"session_key": s_key})
+    laps_raw = _openf1_get("laps", {"session_key": s_key})
+
+    # Map driver_number -> driver metadata
+    drv_info_map: Dict[int, Dict[str, Any]] = {}
+    for d in drivers_raw:
+        num = d.get("driver_number")
+        if num is None:
             continue
-
-    if session is None:
-        print("__RESULT_JSON__:" + json.dumps({"ok": False}))
-        return
-
-    laps: pd.DataFrame = session.laps.copy()
-    laps["LapTimeSec"] = laps["LapTime"].dt.total_seconds()
-
-    total_laps = int(laps["LapNumber"].max()) if not laps["LapNumber"].isna().all() else prior["total_laps"]
-    total_laps = max(30, total_laps)
-
-    # Measure empirical pit-lane loss from green-flag pit-in + pit-out pairs
-    pit_losses: List[float] = []
-    for _, dlaps in laps.groupby("Driver"):
-        dlaps = dlaps.sort_values("LapNumber").reset_index(drop=True)
-        clean_drv = dlaps[
-            dlaps["PitInTime"].isna()
-            & dlaps["PitOutTime"].isna()
-            & (dlaps["TrackStatus"].astype(str) == "1")
-            & (dlaps["LapNumber"] > 2)
-            & dlaps["LapTimeSec"].notna()
-        ]
-        if len(clean_drv) < 10:
-            continue
-        median_pace = float(clean_drv["LapTimeSec"].median())
-
-        for i in range(len(dlaps) - 1):
-            row_in = dlaps.iloc[i]
-            row_out = dlaps.iloc[i + 1]
-            if pd.notna(row_in["PitInTime"]) and pd.notna(row_out["PitOutTime"]):
-                if str(row_in["TrackStatus"]) == "1" and str(row_out["TrackStatus"]) == "1":
-                    t_in = row_in["LapTimeSec"]
-                    t_out = row_out["LapTimeSec"]
-                    if pd.notna(t_in) and pd.notna(t_out):
-                        loss = (t_in + t_out) - (2.0 * median_pace)
-                        if 14.0 <= loss <= 36.0:
-                            pit_losses.append(float(loss))
-
-    pit_loss_sec = round(float(np.median(pit_losses)), 2) if len(pit_losses) >= 3 else prior["pit_loss_sec"]
-
-    green = laps[
-        (laps["TrackStatus"].astype(str) == "1")
-        & laps["PitInTime"].isna()
-        & laps["PitOutTime"].isna()
-        & (laps["LapNumber"] >= 2)
-        & laps["LapTimeSec"].notna()
-        & laps["Compound"].isin(["SOFT", "MEDIUM", "HARD"])
-    ].copy()
-
-    if len(green) > 20:
-        med_all = float(green["LapTimeSec"].median())
-        green = green[green["LapTimeSec"] <= med_all * 1.07].copy()
-
-    fuel_load = prior["fuel_load_kg"]
-    fuel_burn = round(fuel_load / max(1, total_laps), 3)
-    fuel_eff = prior["fuel_effect_sec_per_kg"]
-
-    green["FuelPenaltySec"] = (
-        np.maximum(0.0, fuel_load - (green["LapNumber"] - 1) * fuel_burn) * fuel_eff
-    )
-    green["FuelCorrectedSec"] = green["LapTimeSec"] - green["FuelPenaltySec"]
-
-    if len(green) >= 15:
-        base_lap_time_sec = round(float(np.percentile(green["FuelCorrectedSec"], 10)), 2)
-    else:
-        base_lap_time_sec = prior["base_lap_time_sec"]
-
-    total_lap_records = max(1, len(laps))
-    sc_records = laps["TrackStatus"].astype(str).apply(lambda s: any(c in s for c in ("4", "6", "7"))).sum()
-    empirical_sc_prob = float(np.clip(sc_records / total_lap_records / 4.0, 0.010, 0.045))
-    sc_prob = round(0.5 * empirical_sc_prob + 0.5 * prior["safety_car_prob_per_lap"], 4)
-
-    default_offsets = {"SOFT": 0.00, "MEDIUM": 0.55, "HARD": 1.15}
-    default_degs = {"SOFT": 0.095, "MEDIUM": 0.055, "HARD": 0.030}
-    compound_fit: Dict[str, Dict[str, float]] = {}
-    raw_base_by_comp: Dict[str, float] = {}
-    raw_deg_by_comp: Dict[str, float] = {}
-
-    for comp in ("SOFT", "MEDIUM", "HARD"):
-        sub = green[(green["Compound"] == comp) & green["TyreLife"].notna()].copy()
-        sub = sub[(sub["TyreLife"] >= 1) & (sub["TyreLife"] <= 42)]
-        if len(sub) >= 12:
-            binned = sub.groupby("TyreLife")["FuelCorrectedSec"].quantile(0.25).reset_index()
-            if len(binned) >= 4:
-                slope, intercept = np.polyfit(binned["TyreLife"].values, binned["FuelCorrectedSec"].values, 1)
-                raw_deg_by_comp[comp] = float(np.clip(slope, 0.012, 0.160))
-                raw_base_by_comp[comp] = float(intercept)
-
-    soft_ref = raw_base_by_comp.get("SOFT", base_lap_time_sec)
-    for comp in ("SOFT", "MEDIUM", "HARD"):
-        if comp in raw_base_by_comp:
-            offset = 0.0 if comp == "SOFT" else float(np.clip(raw_base_by_comp[comp] - soft_ref, 0.0, 2.2))
-            deg = raw_deg_by_comp[comp]
-        else:
-            offset = default_offsets[comp]
-            deg = round(default_degs[comp] * prior["tire_wear_multiplier"], 4)
-
-        compound_fit[comp] = {
-            "base_offset_sec": round(offset, 3),
-            "deg_per_lap_sec": round(deg, 4),
+        drv_info_map[int(num)] = {
+            "driver_code": str(d.get("name_acronym") or f"#{num}").strip(),
+            "driver_name": str(d.get("full_name") or d.get("broadcast_name") or f"Driver #{num}").strip().title(),
+            "team": str(d.get("team_name") or "F1 Team").strip(),
         }
 
-    if compound_fit["MEDIUM"]["base_offset_sec"] < compound_fit["SOFT"]["base_offset_sec"] + 0.15:
-        compound_fit["MEDIUM"]["base_offset_sec"] = 0.45
-    if compound_fit["HARD"]["base_offset_sec"] < compound_fit["MEDIUM"]["base_offset_sec"] + 0.15:
-        compound_fit["HARD"]["base_offset_sec"] = round(compound_fit["MEDIUM"]["base_offset_sec"] + 0.50, 3)
+    # Map driver_number -> official FIA finishing classification from /session_result
+    official_result_map: Dict[int, Dict[str, Any]] = {}
+    for res in results_raw:
+        num = res.get("driver_number")
+        if num is None:
+            continue
+        num_i = int(num)
+        pos_val = res.get("position")
+        dnf = bool(res.get("dnf"))
+        dns = bool(res.get("dns"))
+        dsq = bool(res.get("dsq"))
+        num_laps = res.get("number_of_laps")
 
-    if compound_fit["MEDIUM"]["deg_per_lap_sec"] > compound_fit["SOFT"]["deg_per_lap_sec"]:
-        compound_fit["MEDIUM"]["deg_per_lap_sec"] = round(compound_fit["SOFT"]["deg_per_lap_sec"] * 0.65, 4)
-    if compound_fit["HARD"]["deg_per_lap_sec"] > compound_fit["MEDIUM"]["deg_per_lap_sec"]:
-        compound_fit["HARD"]["deg_per_lap_sec"] = round(compound_fit["MEDIUM"]["deg_per_lap_sec"] * 0.60, 4)
+        if dsq:
+            status_str = "DSQ"
+            pos_int = 98
+        elif dns:
+            status_str = "DNS"
+            pos_int = 99
+        elif dnf:
+            status_str = "DNF"
+            pos_int = int(pos_val) if pos_val is not None else 95
+        else:
+            status_str = "Finished"
+            pos_int = int(pos_val) if pos_val is not None else 90
 
-    calibrated_wear_mult = round(float(np.clip(compound_fit["MEDIUM"]["deg_per_lap_sec"] / 0.055, 0.50, 1.65)), 2)
+        official_result_map[num_i] = {
+            "position": pos_int,
+            "status": status_str,
+            "number_of_laps": int(num_laps) if num_laps is not None else 0,
+        }
 
-    circuit_entry = {
-        "round": prior["round"],
-        "name": prior["name"],
-        "country": prior["country"],
+    # Group stints by driver_number
+    stints_by_driver: Dict[int, List[Dict[str, Any]]] = {}
+    max_lap_seen = 0
+    for st in stints_raw:
+        num = st.get("driver_number")
+        comp = _normalize_compound(st.get("compound"))
+        lap_start = st.get("lap_start")
+        lap_end = st.get("lap_end")
+        if num is None or not comp or lap_start is None or lap_end is None:
+            continue
+        l_start = int(lap_start)
+        l_end = int(lap_end)
+        max_lap_seen = max(max_lap_seen, l_end)
+        stints_by_driver.setdefault(int(num), []).append(
+            {
+                "stint_number": int(st.get("stint_number") or len(stints_by_driver.get(int(num), [])) + 1),
+                "compound": comp,
+                "lap_start": l_start,
+                "lap_end": l_end,
+            }
+        )
+
+    total_laps = max(30, max_lap_seen) if max_lap_seen >= 25 else cfg["total_laps"]
+
+    # Calibrate fuel-corrected clean base lap time from OpenF1 /laps
+    all_fuel_corrected: List[float] = []
+    fuel_load = cfg["fuel_load_kg"]
+    fuel_burn = round(fuel_load / max(1, total_laps), 3)
+    fuel_eff = cfg["fuel_effect_sec_per_kg"]
+
+    for lp in laps_raw:
+        dur = lp.get("lap_duration")
+        lap_num = lp.get("lap_number")
+        is_pit_out = bool(lp.get("is_pit_out_lap"))
+        if dur is None or lap_num is None:
+            continue
+        dur_f = float(dur)
+        lap_i = int(lap_num)
+        if not is_pit_out and lap_i >= 2 and 55.0 <= dur_f <= 145.0:
+            fuel_pen = max(0.0, fuel_load - (lap_i - 1) * fuel_burn) * fuel_eff
+            all_fuel_corrected.append(dur_f - fuel_pen)
+
+    if len(all_fuel_corrected) >= 20:
+        med_fc = float(np.median(all_fuel_corrected))
+        trimmed = [t for t in all_fuel_corrected if t <= med_fc * 1.06]
+        base_lap_time_sec = round(float(np.percentile(trimmed, 10)), 2) if len(trimmed) >= 15 else cfg["base_lap_time_sec"]
+    else:
+        base_lap_time_sec = cfg["base_lap_time_sec"]
+
+    # Build driver strategy entries
+    drivers_list: List[Dict[str, Any]] = []
+    for num_i, dstints in stints_by_driver.items():
+        dstints.sort(key=lambda s: (s["stint_number"], s["lap_start"]))
+        start_compound = dstints[0]["compound"]
+        pit_laps: List[int] = []
+        next_compounds: List[str] = []
+
+        for idx in range(len(dstints) - 1):
+            box_lap = int(dstints[idx]["lap_end"])
+            next_comp = dstints[idx + 1]["compound"]
+            if 1 <= box_lap <= max(1, total_laps - 1):
+                pit_laps.append(box_lap)
+                next_compounds.append(next_comp)
+
+        stint_sequence = [start_compound] + next_compounds
+        short_codes = [c[0] for c in stint_sequence]
+        if pit_laps:
+            lap_str = ", ".join(f"L{lap}" for lap in pit_laps)
+            summary = f"{' → '.join(short_codes)} ({len(pit_laps)}-Stop: {lap_str})"
+        else:
+            summary = f"{short_codes[0]} (0-Stop)"
+
+        meta = drv_info_map.get(
+            num_i,
+            {
+                "driver_code": f"#{num_i}",
+                "driver_name": f"Driver #{num_i}",
+                "team": "F1 Constructor",
+            },
+        )
+        res_info = official_result_map.get(num_i, {})
+        laps_completed = res_info.get("number_of_laps") or max(s["lap_end"] for s in dstints)
+        pos = res_info.get("position", 90)
+        status = res_info.get(
+            "status",
+            "Finished" if laps_completed >= total_laps - 1 else f"+{total_laps - laps_completed} Laps",
+        )
+        is_dry_only = all(c in DRY_COMPOUNDS for c in stint_sequence)
+
+        drivers_list.append(
+            {
+                "position": pos,
+                "grid_position": 0,
+                "driver_code": meta["driver_code"],
+                "driver_name": meta["driver_name"],
+                "team": meta["team"],
+                "status": status,
+                "laps_completed": laps_completed,
+                "num_stops": len(pit_laps),
+                "start_compound": start_compound,
+                "pit_laps": pit_laps,
+                "compounds": next_compounds,
+                "stint_sequence": stint_sequence,
+                "strategy_summary": summary,
+                "is_dry_only": is_dry_only,
+            }
+        )
+
+    # Sort by official FIA classification position, then laps completed
+    drivers_list.sort(key=lambda d: (d["position"], -d["laps_completed"], d["driver_code"]))
+    for rank_idx, d in enumerate(drivers_list, start=1):
+        if d["position"] >= 90:
+            d["position"] = rank_idx
+
+    c_entry = {
+        "round": cfg["round"],
+        "name": cfg["name"],
+        "country": cfg["country"],
         "total_laps": total_laps,
         "base_lap_time_sec": base_lap_time_sec,
-        "pit_loss_sec": pit_loss_sec,
+        "pit_loss_sec": cfg["pit_loss_sec"],
         "fuel_load_kg": fuel_load,
         "fuel_burn_per_lap_kg": fuel_burn,
         "fuel_effect_sec_per_kg": fuel_eff,
-        "tire_wear_multiplier": calibrated_wear_mult,
-        "overtaking_difficulty": prior["overtaking_difficulty"],
-        "dirty_air_penalty_sec": prior["dirty_air_penalty_sec"],
-        "safety_car_prob_per_lap": sc_prob,
-        "rain_prob": prior["rain_prob"],
-        "telemetry_source": f"FastF1: {source_label}",
+        "tire_wear_multiplier": cfg["tire_wear_multiplier"],
+        "overtaking_difficulty": cfg["overtaking_difficulty"],
+        "dirty_air_penalty_sec": cfg["dirty_air_penalty_sec"],
+        "safety_car_prob_per_lap": cfg["safety_car_prob_per_lap"],
+        "rain_prob": cfg["rain_prob"],
+        "telemetry_source": f"OpenF1 Live Timing: {query_label}",
     }
+    comp_fit = {
+        "SOFT": {"base_offset_sec": 0.00, "deg_per_lap_sec": round(0.095 * cfg["tire_wear_multiplier"], 4)},
+        "MEDIUM": {"base_offset_sec": 0.55, "deg_per_lap_sec": round(0.055 * cfg["tire_wear_multiplier"], 4)},
+        "HARD": {"base_offset_sec": 1.15, "deg_per_lap_sec": round(0.030 * cfg["tire_wear_multiplier"], 4)},
+    }
+    strat_entry = {
+        "source": f"OpenF1 Official Timing: {query_label}",
+        "total_laps": total_laps,
+        "drivers": drivers_list,
+    }
+    return c_entry, comp_fit, strat_entry
 
-    payload = {"ok": True, "circuit": circuit_entry, "compounds": compound_fit}
-    print("__RESULT_JSON__:" + json.dumps(payload))
 
-
-def _fallback_entry(cfg: Dict[str, Any], reason: str) -> Tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
-    """Return 2026 FIA baseline telemetry profile if FastF1 child process cannot parse stream."""
+def _fallback_entry(
+    cfg: Dict[str, Any], reason: str
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, float]], Dict[str, Any]]:
+    """Return 2026 FIA baseline telemetry profile if OpenF1 has no session data yet."""
     c_entry = {
         "round": cfg["round"],
         "name": cfg["name"],
@@ -618,51 +802,48 @@ def _fallback_entry(cfg: Dict[str, Any], reason: str) -> Tuple[Dict[str, Any], D
         "MEDIUM": {"base_offset_sec": 0.55, "deg_per_lap_sec": round(0.055 * cfg["tire_wear_multiplier"], 4)},
         "HARD": {"base_offset_sec": 1.15, "deg_per_lap_sec": round(0.030 * cfg["tire_wear_multiplier"], 4)},
     }
-    return c_entry, comp_fit
+    strat_entry = {
+        "source": f"No race classification available ({reason})",
+        "total_laps": cfg["total_laps"],
+        "drivers": [],
+    }
+    return c_entry, comp_fit, strat_entry
 
 
 def run_calibration() -> None:
-    """Orchestrate subprocess FastF1 extraction across all 23 circuits of the 2026 season."""
+    """Orchestrate OpenF1 REST telemetry & strategy extraction across all 23 circuits."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     calibrated_circuits: Dict[str, Any] = {}
     calibrated_compounds: Dict[str, Any] = {}
+    calibrated_strategies: Dict[str, Any] = {}
 
-    print("=" * 82)
-    print("🏎️  FASTF1 TELEMETRY CALIBRATION — 2026 FORMULA 1 CALENDAR (ALL 23 CIRCUITS)")
-    print("=" * 82)
+    print("=" * 88)
+    print("🏎️  OPENF1 LIVE TIMING & ACTUAL RACE STRATEGY CALIBRATION (ALL 23 ROUNDS)")
+    print("=" * 88)
 
     for key, cfg in CALENDAR_2026.items():
         rnd = cfg["round"]
         print(f"[R{rnd:02d}/23] Fetching {cfg['name']} ({cfg['country']})...", end=" ", flush=True)
 
-        proc = subprocess.run(
-            [sys.executable, __file__, "--worker", key],
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        openf1_res = _fetch_openf1_circuit_and_strategies(cfg)
+        if openf1_res is not None:
+            c_entry, comp_fit, strat_entry = openf1_res
+        else:
+            c_entry, comp_fit, strat_entry = _fallback_entry(cfg, "Session pending")
 
-        parsed = None
-        if proc.returncode == 0:
-            for line in proc.stdout.splitlines():
-                if line.startswith("__RESULT_JSON__:"):
-                    parsed = json.loads(line.split("__RESULT_JSON__:", 1)[1])
-                    break
-
-        if parsed and parsed.get("ok"):
-            c_entry = parsed["circuit"]
-            comp_fit = parsed["compounds"]
+        n_drivers = len(strat_entry.get("drivers", []))
+        if n_drivers > 0:
+            w = strat_entry["drivers"][0]
             print(
-                f"OK -> {c_entry['telemetry_source']} | Laps={c_entry['total_laps']}, "
-                f"Base={c_entry['base_lap_time_sec']:.2f}s, PitLoss={c_entry['pit_loss_sec']:.2f}s"
+                f"OK -> {c_entry['telemetry_source']} | Laps={c_entry['total_laps']} | "
+                f"P1 {w['driver_code']}: {w['strategy_summary']} ({n_drivers} drivers)"
             )
         else:
-            reason = f"C-ext exit {proc.returncode}" if proc.returncode != 0 else "No session yet"
-            c_entry, comp_fit = _fallback_entry(cfg, reason)
-            print(f"FALLBACK ({reason}) -> Laps={c_entry['total_laps']}, Base={c_entry['base_lap_time_sec']:.2f}s")
+            print(f"BASELINE -> {c_entry['telemetry_source']}")
 
         calibrated_circuits[key] = c_entry
         calibrated_compounds[key] = comp_fit
+        calibrated_strategies[key] = strat_entry
 
     with CIRCUITS_OUT.open("w", encoding="utf-8") as f:
         json.dump(calibrated_circuits, f, indent=2, ensure_ascii=False)
@@ -670,14 +851,15 @@ def run_calibration() -> None:
     with COMPOUNDS_OUT.open("w", encoding="utf-8") as f:
         json.dump(calibrated_compounds, f, indent=2, ensure_ascii=False)
 
-    print("=" * 82)
+    with STRATEGIES_OUT.open("w", encoding="utf-8") as f:
+        json.dump(calibrated_strategies, f, indent=2, ensure_ascii=False)
+
+    print("=" * 88)
     print(f"✅ Saved all {len(calibrated_circuits)} circuits to {CIRCUITS_OUT}")
     print(f"✅ Saved circuit-specific compound fits to {COMPOUNDS_OUT}")
-    print("=" * 82)
+    print(f"✅ Saved actual Grand Prix driver strategies to {STRATEGIES_OUT}")
+    print("=" * 88)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--worker":
-        _worker_extract_single_circuit(sys.argv[2])
-    else:
-        run_calibration()
+    run_calibration()
