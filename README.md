@@ -1,60 +1,70 @@
-# 🏎️ F1 / Endurance Pit-Wall Strategy Simulator
+# 🏎️ F1 / Endurance Pit-Wall Strategy Simulator (`v2.0 — 2026 FastF1 Edition`)
 
-An interactive motorsport race-strategy optimization engine and pit-wall telemetry dashboard built in Python using **Dynamic Programming**, **Monte Carlo stochastic rollouts**, and **lap-by-lap vehicle physics**.
-
----
-
-## 🎯 Engineering Overview
-
-In Formula 1 and Endurance racing, race strategy is a constrained sequential decision problem under uncertainty. Pit walls must balance deterministic tire degradation and fuel-burn physics against stochastic race disruptions (Safety Cars, passing rain cells, and rival undercuts).
-
-This simulator combines three core modules:
-
-1. **Lap-by-Lap Vehicle & Track Physics (`engine/physics.py`)**
-   - **Fuel Mass Reduction:** Linear fuel burn decreasing vehicle mass and improving lap time via $\Delta t_{\text{fuel}}(k) = m_{\text{fuel}}(k) \cdot c_{\text{fuel}}$.
-   - **Non-Linear Tire Degradation & Thermal Cliff:** Compound-specific linear rubber wear combined with a quadratic performance cliff once stint age $a$ exceeds the thermal/wear threshold $a_{\text{cliff}}$:
-     $$\Delta t_{\text{tire}}(c, a) = \Delta t_{0,c} + \alpha_c \mu_{\text{track}} a + \beta_c \max(0, a - a_{\text{cliff}})^2$$
-   - **Wet-Weather Compound Crossover:** Continuous track-wetness modeling across Slicks, Intermediates, and Full Wets.
-   - **Wake Aerodynamics:** Dirty-air downforce penalty when trailing within $1.0\text{ s}$ of a rival car without sufficient pace delta to overcome circuit overtaking difficulty.
-
-2. **Bellman Dynamic Programming & Monte Carlo Solver (`engine/optimizer.py`)**
-   - **Exact Backward Dynamic Programming:** Solves for the globally optimal pit-stop lap(s) and compound sequence over state space $(\text{Lap}, \text{Compound}, \text{Tire Age}, \text{2-Compound FIA Rule}, \text{Stops})$ in $<15\text{ ms}$.
-   - **Mid-Race Dynamic Re-Optimization:** Re-solves optimal remaining stints from any live lap (e.g., evaluating whether to box immediately under a Safety Car's $45\%$ pit-loss discount).
-   - **Monte Carlo Rollout Engine:** Stress-tests strategies across hundreds of randomized race futures with Poisson-like Safety Car windows, passing rain cells, and stochastic lap-time perturbations to compute **Win Probability (%)** and **10th–90th percentile confidence bands**.
-
-3. **Interactive Pit-Wall Dashboard (`app.py`)**
-   - Real-time **Streamlit + Plotly** command center featuring live gap-to-rival fan charts, compound degradation curves, DP strategy leaderboards, and interactive **"Chaos Buttons"** (Deploy Safety Car, Rival Early Undercut, Passing Rain Shower).
+An interactive motorsport race-strategy optimizer and stochastic pit-wall decision engine built in Python. Combines **real Formula 1 telemetry calibration (`fastf1`)** across all **23 circuits of the 2026 FIA Formula 1 World Championship** with **exact Backward Dynamic Programming (Bellman optimality)** and **Monte Carlo stochastic race simulations**.
 
 ---
 
-## 📂 Project Structure
+## ✨ Key Capabilities
+
+1. **Automated FastF1 Telemetry ETL & Calibration Pipeline (`data/calibrate_fastf1.py`)**
+   - Extracts real Grand Prix race sessions (`R`) across all **23 rounds of the 2026 F1 calendar** using crash-isolated worker processes and local disk caching (`data/fastf1_cache/`).
+   - Filters out Lap 1, pit-in/pit-out laps, Safety Car / VSC periods (`TrackStatus != '1'`), and 107% outliers.
+   - Removes fuel-mass burn effects to isolate pure **clean-air base lap pace** (10th percentile), **empirical pit-lane time loss** (median pit-in + pit-out delta vs. green-flag median), **Safety Car deployment probability**, and **per-compound linear degradation slopes** (`SOFT`, `MEDIUM`, `HARD`).
+
+2. **Lap-by-Lap Vehicle & Tire Physics Engine (`engine/physics.py`)**
+   - **Fuel Mass Burn:** Linear fuel burn model reducing car mass and lap time over the race distance.
+   - **Compound Degradation & Thermal Cliff:** Circuit-specific empirical pace offsets and linear rubber wear combined with a non-linear quadratic performance cliff beyond each compound's thermal life:
+     $$\Delta t_{\text{tire}}(c, a) = \Delta t_{0,c} + \alpha_c \cdot a + \beta_c \cdot \max\left(0, a - a_{\text{cliff},c}\right)^2 + \Delta t_{\text{wet}}(c, w)$$
+   - **Wake Aerodynamics & Overtaking Thresholds:** Models dirty-air downforce loss when trailing within `1.0s` unless net pace advantage overcomes circuit-specific overtaking difficulty.
+   - **Safety Car Neutralization:** Compresses field gaps and discounts pit-stop delta by ~45% during Safety Car windows.
+
+3. **Exact Backward Dynamic Programming Solver (`engine/optimizer.py`)**
+   - Solves the finite-horizon Bellman optimality equations across state space `(lap, compound, tire_age, used_two_compounds, stops_used)` to find the globally optimal pit-stop lap(s) and compound sequence.
+   - Strictly enforces the sporting regulation requiring at least **two distinct dry compounds** in a dry race.
+   - Supports **live mid-race re-optimization** from any race lap and tire state (e.g., instantaneous pit-wall reaction to a Safety Car deployment).
+
+4. **Monte Carlo Stochastic Risk Engine & Interactive Pit-Wall UI (`app.py`)**
+   - Stress-tests candidate strategies across hundreds of stochastic race futures featuring random Safety Car windows, passing rain cells (with automatic Dry $\leftrightarrow$ Intermediate $\leftrightarrow$ Full Wet crossover rules), and Gaussian lap-time variance.
+   - Dark-mode **Streamlit + Plotly** command center with live chaos toggles, P10–P90 confidence fan charts, calibrated compound degradation curves, and a full DP strategy leaderboard.
+
+---
+
+## 📁 Project Architecture
 
 ```text
 f1-pitwall-optimizer/
-├── app.py                  # Streamlit + Plotly interactive pit-wall dashboard
-├── requirements.txt        # Python dependencies (NumPy, SciPy, Pandas, Plotly, Streamlit)
 ├── data/
-│   └── circuits.json       # Circuit physics & operational presets (Monza, Silverstone, Suzuka, Monaco, Bahrain, Spa)
-└── engine/
-    ├── __init__.py
-    ├── physics.py          # Fuel burn, tire cliff, dirty-air aero, and race trace simulation
-    └── optimizer.py        # Backward Dynamic Programming solver + Monte Carlo rollout engine
+│   ├── calibrate_fastf1.py     # FastF1 ETL & empirical parameter calibration script (23 circuits)
+│   ├── circuits.json           # Calibrated 2026 circuit boundary conditions (R01–R23)
+│   └── compound_profiles.json  # Circuit-specific empirical Soft/Medium/Hard wear fits
+├── engine/
+│   ├── __init__.py
+│   ├── physics.py              # Fuel, tire cliff, wet crossover, dirty air, and race trace physics
+│   └── optimizer.py            # Backward DP solver, mid-race re-solver, and Monte Carlo engine
+├── app.py                      # Streamlit + Plotly interactive pit-wall dashboard
+├── requirements.txt            # numpy, scipy, pandas, plotly, streamlit, fastf1
+├── LICENSE                     # MIT License
+└── README.md
 
-🚀 Quickstart (Run Locally)
-# 1. Clone the repository
-git clone [https://github.com/YOUR_USERNAME/f1-pitwall-optimizer.git](https://github.com/YOUR_USERNAME/f1-pitwall-optimizer.git)
+🚀 Quickstart (Local Setup)
+
+1. Clone & Create Virtual Environment
+git clone [https://github.com/](https://github.com/)<your-username>/f1-pitwall-optimizer.git
 cd f1-pitwall-optimizer
-
-# 2. Create and activate a virtual environment
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# 3. Install dependencies
+source venv/bin/activate
 pip install -r requirements.txt
 
-# 4. Launch the interactive Pit-Wall Dashboard
+2. Run FastF1 Telemetry Calibration (Optional — Pre-Calibrated JSONs Included)
+python data/calibrate_fastf1.py
+
+3. Launch the Interactive Pit-Wall Dashboard
 streamlit run app.py
 
 🛠️ Tech Stack
-Core Computation: Python 3, NumPy, SciPy, Pandas
-Visualization & UI: Plotly, Streamlit
+Telemetry & Data Engineering: fastf1, pandas, numpy
+Optimization & Simulation: Exact Backward Dynamic Programming (NumPy), Monte Carlo Stochastic Rollouts
+Interactive Visualization: streamlit, plotly
+
+📜 License
+Released under the MIT License.
