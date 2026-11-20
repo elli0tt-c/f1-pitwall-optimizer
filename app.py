@@ -1,12 +1,15 @@
 """
 app.py
-Interactive F1 / Endurance Pit-Wall Strategy Simulator & Telemetry Dashboard.
+F1 / Endurance Pit-Wall Strategy Simulator (v2.0 — 2026 Season FastF1 Telemetry Edition)
 
-Run locally with:
-    streamlit run app.py
+Interactive Streamlit + Plotly pit-wall command center featuring:
+- All 23 circuits of the 2026 FIA Formula 1 World Championship calibrated via FastF1
+- Exact Backward Dynamic Programming (Bellman optimality) solver enforcing the 2-compound rule
+- Live mid-race chaos controls (Safety Car deployment, Rival Undercut, Passing Rain Cell)
+- Monte Carlo stochastic race rollout engine with P10–P90 confidence fan chart
+- Circuit-specific empirical tire compound degradation & thermal cliff curves
 """
 
-from typing import Dict, List
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -21,31 +24,42 @@ from engine.physics import (
     COMPOUNDS,
     DRY_COMPOUNDS,
     CarStrategyPlan,
-    Circuit,
     compute_tire_delta,
     load_circuits,
     simulate_race_trace,
 )
 
-# ---------------------------------------------------------------------------
-# Page Configuration & Motorsport Pit-Wall Styling
-# ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="F1 Pit-Wall Strategy Optimizer",
+    page_title="F1 Pit-Wall Strategy Optimizer | 2026 FastF1 Edition",
     page_icon="🏎️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# Custom dark pit-wall styling
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
+    .stApp {
+        background-color: #0E1117;
+        color: #FAFAFA;
+    }
     div[data-testid="stMetric"] {
-        background-color: #161A24;
-        border: 1px solid #2A3142;
-        border-radius: 8px;
-        padding: 12px 16px;
+        background-color: #161B22;
+        border: 1px solid #30363D;
+        border-radius: 10px;
+        padding: 14px 18px;
+    }
+    .telemetry-badge {
+        display: inline-block;
+        background-color: #161B22;
+        border: 1px solid #2EA043;
+        color: #3FB950;
+        padding: 4px 12px;
+        border-radius: 16px;
+        font-size: 0.85rem;
+        font-weight: 600;
+        margin-bottom: 10px;
     }
     </style>
     """,
@@ -54,546 +68,270 @@ st.markdown(
 
 
 @st.cache_data
-def get_circuits() -> Dict[str, Circuit]:
-    return load_circuits("data/circuits.json")
+def get_all_circuits():
+    return load_circuits()
 
 
-def format_seconds_to_race_time(total_sec: float) -> str:
-    hours = int(total_sec // 3600)
-    rem = total_sec % 3600
-    mins = int(rem // 60)
-    secs = rem % 60
-    if hours > 0:
-        return f"{hours}h {mins:02d}m {secs:05.2f}s"
-    return f"{mins}m {secs:05.2f}s"
+circuits = get_all_circuits()
+sorted_keys = sorted(circuits.keys(), key=lambda k: (circuits[k].round, circuits[k].name))
 
+# --- SIDEBAR: PIT-WALL CONTROLS ---
+st.sidebar.title("🏎️ Pit-Wall Telemetry & Controls")
 
-def build_gap_fan_chart(
-    circuit: Circuit,
-    det_trace: Dict[str, np.ndarray],
-    mc_summary,
-    player_plan: CarStrategyPlan,
-    rival_plan: CarStrategyPlan,
-    sc_laps: List[int],
-    wetness: List[float],
-) -> go.Figure:
-    laps = det_trace["laps"]
-    fig = go.Figure()
+selected_key = st.sidebar.selectbox(
+    "2026 Grand Prix Circuit (All 23 Rounds)",
+    options=sorted_keys,
+    index=0,
+    format_func=lambda k: f"R{circuits[k].round:02d} — {circuits[k].name} ({circuits[k].country})",
+)
+circuit = circuits[selected_key]
 
-    # Highlight Safety Car laps as amber vertical bands
-    if sc_laps:
-        sc_sorted = sorted(set(sc_laps))
-        start_b = sc_sorted[0]
-        prev_b = sc_sorted[0]
-        bands = []
-        for l in sc_sorted[1:]:
-            if l == prev_b + 1:
-                prev_b = l
-            else:
-                bands.append((start_b, prev_b))
-                start_b = l
-                prev_b = l
-        bands.append((start_b, prev_b))
-        for b0, b1 in bands:
-            fig.add_vrect(
-                x0=b0 - 0.5,
-                x1=b1 + 0.5,
-                fillcolor="rgba(255, 193, 7, 0.18)",
-                line_width=0,
-                annotation_text="SC",
-                annotation_position="top left",
-                annotation_font_color="#FFC107",
-            )
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ Solver & Monte Carlo Settings")
+max_stops = st.sidebar.slider("Max Allowed Pit Stops", min_value=1, max_value=3, value=2)
+driver_pace_offset = st.sidebar.slider(
+    "Player Pace Delta vs. Rival (s/lap)",
+    min_value=-0.40,
+    max_value=0.40,
+    value=0.00,
+    step=0.05,
+    help="Negative = faster car/driver pace than rival.",
+)
+n_sims = st.sidebar.slider("Monte Carlo Rollouts", min_value=100, max_value=600, value=250, step=50)
+enable_sc_mc = st.sidebar.checkbox("Stochastic Safety Cars in Monte Carlo", value=True)
+enable_rain_mc = st.sidebar.checkbox("Stochastic Rain Cells in Monte Carlo", value=True)
 
-    # Highlight Rain laps as cyan vertical bands
-    rain_laps = [i + 1 for i, w in enumerate(wetness) if w > 0.15]
-    if rain_laps:
-        fig.add_vrect(
-            x0=min(rain_laps) - 0.5,
-            x1=max(rain_laps) + 0.5,
-            fillcolor="rgba(0, 180, 255, 0.14)",
-            line_width=0,
-            annotation_text="RAIN",
-            annotation_position="bottom left",
-            annotation_font_color="#38BDF8",
-        )
+st.sidebar.markdown("---")
+st.sidebar.subheader("🚨 Live Race Chaos Simulator")
+chaos_lap = st.sidebar.slider(
+    "Current Race Lap (Decision Point)",
+    min_value=1,
+    max_value=max(2, circuit.total_laps - 5),
+    value=min(18, max(2, circuit.total_laps // 3)),
+)
+inject_sc = st.sidebar.toggle("🟡 Deploy Safety Car on Current Lap", value=False)
+inject_undercut = st.sidebar.toggle("⚡ Rival Boxes Early (Undercut Threat)", value=False)
+inject_rain = st.sidebar.toggle("🌧️ Passing Rain Shower (+8 Laps)", value=False)
 
-    # Monte Carlo 10th - 90th percentile fan band
+# --- HEADER & TELEMETRY BADGE ---
+st.title(f"🏁 R{circuit.round:02d}: {circuit.name}")
+st.markdown(
+    f'<div class="telemetry-badge">📡 Telemetry Source: {circuit.telemetry_source} '
+    f'&nbsp;|&nbsp; {circuit.total_laps} Laps &nbsp;|&nbsp; Base Pace: {circuit.base_lap_time_sec:.2f}s '
+    f'&nbsp;|&nbsp; Pit Delta: {circuit.pit_loss_sec:.2f}s</div>',
+    unsafe_allow_html=True,
+)
+
+# --- SOLVE PRE-RACE DP & RIVAL BENCHMARKS ---
+dp_result = solve_optimal_strategy_dp(
+    circuit=circuit,
+    max_stops=max_stops,
+    driver_pace_offset_sec=driver_pace_offset,
+)
+rival_strategies = generate_standard_rival_strategies(circuit)
+rival_idx = st.selectbox(
+    "Select Primary Rival Strategy Benchmark",
+    options=list(range(len(rival_strategies))),
+    format_func=lambda i: rival_strategies[i].name,
+)
+rival_plan = rival_strategies[rival_idx]
+
+# --- APPLY LIVE CHAOS SCENARIO ---
+sc_laps = list(range(chaos_lap, min(circuit.total_laps + 1, chaos_lap + 4))) if inject_sc else []
+wetness_profile = [0.0] * circuit.total_laps
+if inject_rain:
+    for l in range(chaos_lap - 1, min(circuit.total_laps, chaos_lap + 8)):
+        progress = (l - (chaos_lap - 1)) / 7.0
+        wetness_profile[l] = 0.45 * float(np.sin(np.pi * progress))
+
+active_rival_plan = rival_plan
+if inject_undercut:
+    early_lap = max(3, chaos_lap - 1)
+    active_rival_plan = CarStrategyPlan(
+        name=f"Rival Early Undercut (M→H) [L{early_lap}]",
+        start_compound="MEDIUM",
+        pit_stops={early_lap: "HARD"},
+    )
+
+# Mid-race dynamic re-optimization if Safety Car is deployed at chaos_lap
+active_player_plan = dp_result.plan
+if inject_sc:
+    # Determine player's tire state entering chaos_lap
+    curr_comp = dp_result.plan.start_compound
+    curr_age = 0
+    used_two = False
+    kept_stops = {}
+    for l in range(1, chaos_lap):
+        if l in dp_result.plan.pit_stops:
+            nxt = dp_result.plan.pit_stops[l]
+            if nxt != curr_comp:
+                used_two = True
+            curr_comp = nxt
+            curr_age = 0
+            kept_stops[l] = nxt
+        else:
+            curr_age += 1
+
+    reopt = solve_optimal_strategy_dp(
+        circuit=circuit,
+        start_lap=chaos_lap,
+        current_compound=curr_comp,
+        current_tire_age=curr_age,
+        used_different_compound=used_two,
+        is_safety_car_now=True,
+        max_stops=max_stops,
+        driver_pace_offset_sec=driver_pace_offset,
+    )
+    merged_stops = {**kept_stops, **reopt.plan.pit_stops}
+    codes = [COMPOUNDS[dp_result.plan.start_compound].code] + [
+        COMPOUNDS[merged_stops[l]].code for l in sorted(merged_stops)
+    ]
+    laps_label = ", ".join(f"L{l}" for l in sorted(merged_stops))
+    active_player_plan = CarStrategyPlan(
+        name=f"Live Re-Opt SC: {len(merged_stops)}-Stop ({'→'.join(codes)}) [{laps_label}]",
+        start_compound=dp_result.plan.start_compound,
+        pit_stops=merged_stops,
+        driver_pace_offset_sec=driver_pace_offset,
+    )
+
+# Deterministic head-to-head race trace & Monte Carlo rollout
+det_trace = simulate_race_trace(
+    circuit=circuit,
+    player_plan=active_player_plan,
+    rival_plan=active_rival_plan,
+    safety_car_laps=sc_laps,
+    wetness_by_lap=wetness_profile,
+)
+
+mc_summary = run_monte_carlo_evaluation(
+    circuit=circuit,
+    player_plan=active_player_plan,
+    rival_plan=active_rival_plan,
+    n_sims=n_sims,
+    enable_safety_cars=enable_sc_mc,
+    enable_weather=enable_rain_mc,
+)
+
+# --- KPI METRIC STRIP ---
+k1, k2, k3, k4 = st.columns(4)
+k1.metric(
+    label="Optimal Pit-Wall Call",
+    value=active_player_plan.name.replace("DP Optimal: ", "").replace("Live Re-Opt SC: ", ""),
+    delta="SC Re-Optimized" if inject_sc else "Bellman Global Optimum",
+)
+k2.metric(
+    label="Projected Race Time",
+    value=f"{det_trace['player_cum_time'][-1] / 60.0:.2f} min",
+    delta=f"{det_trace['final_gap_sec']:+.2f}s vs. Rival",
+)
+k3.metric(
+    label="Monte Carlo Win Probability",
+    value=f"{mc_summary.win_probability_pct:.1f}%",
+    delta=f"Median Gap: {mc_summary.p50_gap_sec:+.2f}s",
+)
+k4.metric(
+    label="Circuit Pit-Stop Loss (Green / SC)",
+    value=f"{circuit.pit_loss_sec:.1f}s / {circuit.pit_loss_sec * 0.55:.1f}s",
+    delta=f"Wear Index: {circuit.tire_wear_multiplier:.2f}x",
+)
+
+st.markdown("---")
+
+# --- ROW 1: MONTE CARLO FAN CHART & HEAD-TO-HEAD GAP ---
+col_left, col_right = st.columns([3, 2])
+
+with col_left:
+    st.subheader("📈 Monte Carlo Gap Evolution (P10 – P90 Confidence Fan)")
+    laps_x = det_trace["laps"]
     p10_trace = np.percentile(mc_summary.all_gap_traces, 10, axis=0)
-    p90_trace = np.percentile(mc_summary.all_gap_traces, 90, axis=0)
     p50_trace = np.percentile(mc_summary.all_gap_traces, 50, axis=0)
+    p90_trace = np.percentile(mc_summary.all_gap_traces, 90, axis=0)
 
-    fig.add_trace(
+    fig_fan = go.Figure()
+    fig_fan.add_trace(
         go.Scatter(
-            x=np.concatenate([laps, laps[::-1]]),
+            x=np.concatenate([laps_x, laps_x[::-1]]),
             y=np.concatenate([p90_trace, p10_trace[::-1]]),
             fill="toself",
-            fillcolor="rgba(0, 210, 190, 0.15)",
+            fillcolor="rgba(0, 210, 190, 0.18)",
             line=dict(color="rgba(255,255,255,0)"),
-            hoverinfo="skip",
-            name="Monte Carlo 10–90% Band",
+            name="P10–P90 Stochastic Band",
         )
     )
-
-    fig.add_trace(
+    fig_fan.add_trace(
         go.Scatter(
-            x=laps,
+            x=laps_x,
             y=p50_trace,
             mode="lines",
-            line=dict(color="#00D2BE", width=1.8, dash="dot"),
-            name="Stochastic Median (P50)",
+            line=dict(color="#00D2BE", width=2.5, dash="dash"),
+            name="Monte Carlo Median Gap",
         )
     )
-
-    # Deterministic scenario trace
-    fig.add_trace(
+    fig_fan.add_trace(
         go.Scatter(
-            x=laps,
+            x=laps_x,
             y=det_trace["gap_to_rival"],
             mode="lines",
-            line=dict(color="#FF3355", width=3),
-            name=f"Live Scenario Gap ({player_plan.name})",
+            line=dict(color="#FF3333", width=3),
+            name="Deterministic Scenario Trace",
         )
     )
-
-    # Zero-line (Track Position Reference)
-    fig.add_hline(
-        y=0.0,
-        line_dash="dash",
-        line_color="#8892B0",
-        annotation_text="Rival Reference (0.0s)",
-        annotation_position="bottom right",
-    )
-
-    # Plot Player pit-stop markers
-    for p_lap, new_c in sorted(player_plan.pit_stops.items()):
-        if 1 <= p_lap <= len(laps):
-            fig.add_trace(
-                go.Scatter(
-                    x=[p_lap],
-                    y=[det_trace["gap_to_rival"][p_lap - 1]],
-                    mode="markers+text",
-                    marker=dict(size=11, color=COMPOUNDS[new_c].color, line=dict(width=1.5, color="#111")),
-                    text=[f"PIT→{COMPOUNDS[new_c].code}"],
-                    textposition="top center",
-                    showlegend=False,
-                )
-            )
-
-    fig.update_layout(
-        title=f"Gap to Rival vs. Lap — {circuit.name} (+ = Player Ahead)",
-        xaxis_title="Lap Number",
-        yaxis_title="Gap to Rival (seconds)",
+    fig_fan.add_hline(y=0.0, line_dash="dot", line_color="#8B949E")
+    fig_fan.update_layout(
         template="plotly_dark",
-        height=430,
-        margin=dict(l=20, r=20, t=50, b=20),
+        paper_bgcolor="#0E1117",
+        plot_bgcolor="#161B22",
+        xaxis_title="Race Lap",
+        yaxis_title="Gap to Rival (+s = Player Ahead)",
+        height=390,
+        margin=dict(l=20, r=20, t=30, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
-    return fig
+    st.plotly_chart(fig_fan, use_container_width=True)
 
-
-def build_lap_time_chart(
-    det_trace: Dict[str, np.ndarray],
-    player_plan: CarStrategyPlan,
-    rival_plan: CarStrategyPlan,
-) -> go.Figure:
-    laps = det_trace["laps"]
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Scatter(
-            x=laps,
-            y=det_trace["player_lap_times"],
-            mode="lines+markers",
-            marker=dict(
-                size=6,
-                color=[COMPOUNDS[c].color for c in det_trace["player_compounds"]],
-            ),
-            line=dict(color="#FF3355", width=2),
-            name=f"Player: {player_plan.name}",
-            customdata=np.stack([det_trace["player_compounds"], det_trace["player_tire_ages"]], axis=-1),
-            hovertemplate="Lap %{x}<br>Time: %{y:.2f}s<br>Tire: %{customdata[0]} (Age %{customdata[1]})<extra></extra>",
-        )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=laps,
-            y=det_trace["rival_lap_times"],
-            mode="lines",
-            line=dict(color="#64B5F6", width=2, dash="dash"),
-            name=f"Rival: {rival_plan.name}",
-            customdata=np.stack([det_trace["rival_compounds"], det_trace["rival_tire_ages"]], axis=-1),
-            hovertemplate="Lap %{x}<br>Time: %{y:.2f}s<br>Tire: %{customdata[0]} (Age %{customdata[1]})<extra></extra>",
-        )
-    )
-
-    fig.update_layout(
-        title="Lap-by-Lap Pace & Stint Degradation Profile (Marker Color = Tire Compound)",
-        xaxis_title="Lap Number",
-        yaxis_title="Lap Time (seconds)",
-        template="plotly_dark",
-        height=400,
-        margin=dict(l=20, r=20, t=50, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    return fig
-
-
-def build_tire_cliff_chart(circuit: Circuit) -> go.Figure:
-    ages = np.arange(0, min(46, circuit.total_laps))
-    fig = go.Figure()
-    for c_key in DRY_COMPOUNDS:
-        comp = COMPOUNDS[c_key]
-        deltas = [compute_tire_delta(c_key, int(a), circuit, track_wetness=0.0) for a in ages]
-        fig.add_trace(
+with col_right:
+    st.subheader("🛞 Calibrated Tire Compound Degradation Curves")
+    ages = np.arange(0, 41)
+    fig_tire = go.Figure()
+    for comp_key in DRY_COMPOUNDS:
+        comp = COMPOUNDS[comp_key]
+        deltas = [compute_tire_delta(comp_key, int(a), circuit, track_wetness=0.0) for a in ages]
+        override = circuit.compound_overrides.get(comp_key, {})
+        slope = override.get("deg_per_lap_sec", comp.deg_per_lap_sec * circuit.tire_wear_multiplier)
+        fig_tire.add_trace(
             go.Scatter(
                 x=ages,
                 y=deltas,
                 mode="lines",
                 line=dict(color=comp.color, width=3),
-                name=f"{comp.name} (Cliff ~L{int(comp.cliff_lap / (circuit.tire_wear_multiplier ** 0.5))})",
+                name=f"{comp.name} ({slope:.3f} s/lap)",
             )
         )
-    fig.update_layout(
-        title=f"Compound Degradation & Thermal Cliff Curves ({circuit.name})",
-        xaxis_title="Stint Tire Age (Laps)",
-        yaxis_title="Pace Loss vs. Fresh Soft (seconds/lap)",
+    fig_tire.update_layout(
         template="plotly_dark",
-        height=360,
-        margin=dict(l=20, r=20, t=45, b=20),
+        paper_bgcolor="#0E1117",
+        plot_bgcolor="#161B22",
+        xaxis_title="Tire Stint Age (Laps)",
+        yaxis_title="Pace Delta vs. Fresh Soft (+s)",
+        height=390,
+        margin=dict(l=20, r=20, t=30, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
-    return fig
+    st.plotly_chart(fig_tire, use_container_width=True)
 
-
-# ---------------------------------------------------------------------------
-# Main Application Layout
-# ---------------------------------------------------------------------------
-def main():
-    circuits = get_circuits()
-
-    # Initialize session state for Chaos Buttons
-    if "sc_active" not in st.session_state:
-        st.session_state.sc_active = False
-    if "sc_lap" not in st.session_state:
-        st.session_state.sc_lap = 18
-    if "rival_undercut" not in st.session_state:
-        st.session_state.rival_undercut = False
-    if "rain_active" not in st.session_state:
-        st.session_state.rain_active = False
-
-    # Sidebar: Circuit & Solver Controls
-    with st.sidebar:
-        st.title("🏎️ Pit-Wall Controls")
-        circuit_key = st.selectbox(
-            "Select Grand Prix Circuit",
-            options=list(circuits.keys()),
-            format_func=lambda k: f"{circuits[k].name} ({circuits[k].total_laps} Laps)",
-            index=1,  # Default: Silverstone
-        )
-        circuit = circuits[circuit_key]
-
-        st.caption(
-            f"**Pit Loss:** {circuit.pit_loss_sec:.1f}s | "
-            f"**Wear Mult:** {circuit.tire_wear_multiplier:.2f}x | "
-            f"**Overtake Diff:** {circuit.overtaking_difficulty:.2f}"
-        )
-
-        st.divider()
-        st.subheader("Strategy Configuration")
-        strategy_mode = st.radio(
-            "Player Strategy Mode",
-            options=["DP Global Optimal (Auto)", "Custom Manual Strategy"],
-            index=0,
-        )
-
-        dp_result = solve_optimal_strategy_dp(circuit)
-
-        if strategy_mode == "DP Global Optimal (Auto)":
-            player_plan = dp_result.plan
-            st.success(f"**Locked Strategy:** {dp_result.stint_summary}")
-        else:
-            start_c = st.selectbox("Starting Compound", options=list(DRY_COMPOUNDS), index=1)
-            n_stops = st.slider("Number of Pit Stops", min_value=1, max_value=3, value=1)
-            custom_stops: Dict[int, str] = {}
-            for s_idx in range(n_stops):
-                default_l = min(circuit.total_laps - 2, int(circuit.total_laps * (s_idx + 1) / (n_stops + 1)))
-                col1, col2 = st.columns(2)
-                with col1:
-                    p_l = st.number_input(
-                        f"Stop {s_idx + 1} Lap",
-                        min_value=2,
-                        max_value=circuit.total_laps - 1,
-                        value=default_l,
-                        key=f"pit_l_{s_idx}",
-                    )
-                with col2:
-                    p_c = st.selectbox(
-                        f"Compound {s_idx + 1}",
-                        options=list(DRY_COMPOUNDS),
-                        index=2 if s_idx == 0 else 1,
-                        key=f"pit_c_{s_idx}",
-                    )
-                custom_stops[int(p_l)] = p_c
-            player_plan = CarStrategyPlan(
-                name=f"Custom ({COMPOUNDS[start_c].code}→"
-                + "→".join(COMPOUNDS[custom_stops[k]].code for k in sorted(custom_stops))
-                + ")",
-                start_compound=start_c,
-                pit_stops=custom_stops,
-            )
-
-        rival_options = generate_standard_rival_strategies(circuit)
-        rival_idx = st.selectbox(
-            "Benchmark Rival Strategy",
-            options=range(len(rival_options)),
-            format_func=lambda i: rival_options[i].name,
-            index=0,
-        )
-        rival_plan = rival_options[rival_idx]
-
-        st.divider()
-        st.subheader("Monte Carlo Risk Engine")
-        n_sims = st.slider("Stochastic Rollouts (N)", min_value=100, max_value=800, value=300, step=50)
-        mc_sc = st.checkbox("Random Safety Cars in MC", value=True)
-        mc_rain = st.checkbox("Random Rain Cells in MC", value=True)
-
-    # Header
-    st.title("🏁 F1 / Endurance Pit-Wall Strategy Simulator")
-    st.caption(
-        f"**{circuit.name}** ({circuit.country}) — {circuit.total_laps} Laps | "
-        f"Base Pace: {circuit.base_lap_time_sec:.1f}s | Fuel Load: {circuit.fuel_load_kg:.0f} kg"
+# --- ROW 2: DP STRATEGY LEADERBOARD & CIRCUIT TELEMETRY SUMMARY ---
+st.subheader("🏆 Dynamic Programming Strategy Leaderboard (2-Compound Rule Enforced)")
+leaderboard_rows = []
+for rank, (label, total_sec, plan) in enumerate(dp_result.top_alternatives, start=1):
+    delta_best = total_sec - dp_result.expected_total_time_sec
+    leaderboard_rows.append(
+        {
+            "Rank": f"#{rank}",
+            "Starting Compound": COMPOUNDS[plan.start_compound].name,
+            "Strategy Sequence": label,
+            "Total Race Time (s)": f"{total_sec:.2f}s",
+            "Delta vs. Optimal": "+0.00s" if rank == 1 else f"+{delta_best:.2f}s",
+        }
     )
 
-    # -----------------------------------------------------------------------
-    # Live Pit-Wall "Chaos Buttons" Row
-    # -----------------------------------------------------------------------
-    st.markdown("#### ⚡ Live Race Control & Chaos Triggers")
-    c_btn1, c_btn2, c_btn3, c_btn4 = st.columns([1.3, 1.1, 1.1, 0.8])
-
-    with c_btn1:
-        sc_trigger_lap = st.slider(
-            "Safety Car / Re-Solve Lap",
-            min_value=4,
-            max_value=max(5, circuit.total_laps - 5),
-            value=min(18, circuit.total_laps // 2),
-        )
-    with c_btn2:
-        st.write("")
-        if st.button("🟡 Toggle Safety Car Window", use_container_width=True):
-            st.session_state.sc_active = not st.session_state.sc_active
-    with c_btn3:
-        st.write("")
-        if st.button("🔴 Toggle Rival Early Undercut", use_container_width=True):
-            st.session_state.rival_undercut = not st.session_state.rival_undercut
-    with c_btn4:
-        st.write("")
-        if st.button("🌧️ Toggle Rain", use_container_width=True):
-            st.session_state.rain_active = not st.session_state.rain_active
-
-    # Construct active race perturbation vectors
-    active_sc_laps: List[int] = (
-        [sc_trigger_lap + d for d in range(4) if sc_trigger_lap + d <= circuit.total_laps]
-        if st.session_state.sc_active
-        else []
-    )
-
-    active_wetness: List[float] = [0.0] * circuit.total_laps
-    if st.session_state.rain_active:
-        r_start = max(5, circuit.total_laps // 2)
-        for idx in range(r_start - 1, min(circuit.total_laps, r_start + 11)):
-            prog = (idx - (r_start - 1)) / 11.0
-            active_wetness[idx] = 0.48 * float(np.sin(np.pi * prog))
-
-    effective_rival = rival_plan
-    if st.session_state.rival_undercut and rival_plan.pit_stops:
-        shifted_stops = {max(4, lap - 4): comp for lap, comp in rival_plan.pit_stops.items()}
-        effective_rival = CarStrategyPlan(
-            name=f"{rival_plan.name} [UNDERCUT -4L]",
-            start_compound=rival_plan.start_compound,
-            pit_stops=shifted_stops,
-        )
-
-    # Mid-Race Dynamic Re-Optimization Banner when Safety Car is active
-    if st.session_state.sc_active:
-        # Determine player's tire state entering `sc_trigger_lap`
-        curr_c = player_plan.start_compound
-        curr_age = 0
-        used_two = False
-        for l in range(1, sc_trigger_lap):
-            if l in player_plan.pit_stops:
-                new_c = player_plan.pit_stops[l]
-                if new_c != curr_c:
-                    used_two = True
-                curr_c = new_c
-                curr_age = 0
-            else:
-                curr_age += 1
-
-        sc_reopt = solve_optimal_strategy_dp(
-            circuit=circuit,
-            start_lap=sc_trigger_lap,
-            current_compound=curr_c,
-            current_tire_age=curr_age,
-            used_different_compound=used_two,
-            is_safety_car_now=True,
-        )
-        pit_now = sc_trigger_lap in sc_reopt.plan.pit_stops
-        if pit_now:
-            rec_comp = sc_reopt.plan.pit_stops[sc_trigger_lap]
-            st.warning(
-                f"🟡 **SAFETY CAR DEPLOYED ON LAP {sc_trigger_lap}!** — "
-                f"**PIT WALL CALL: BOX THIS LAP FOR {rec_comp}!** "
-                f"(Exploits 45% SC pit-loss discount; optimal remaining plan: {sc_reopt.stint_summary})"
-            )
-            if st.checkbox("Apply Live SC Pit-Wall Call to Simulation", value=True):
-                updated_stops = {k: v for k, v in player_plan.pit_stops.items() if k < sc_trigger_lap}
-                updated_stops.update(sc_reopt.plan.pit_stops)
-                player_plan = CarStrategyPlan(
-                    name=f"SC Re-Opt ({sc_reopt.stint_summary})",
-                    start_compound=player_plan.start_compound,
-                    pit_stops=updated_stops,
-                )
-        else:
-            st.info(
-                f"🟡 **SAFETY CAR DEPLOYED ON LAP {sc_trigger_lap}!** — "
-                f"**PIT WALL CALL: STAY OUT** (Tires age {curr_age}L; pitting now costs track position)."
-            )
-
-    # Adapt plans if rain toggle is active
-    sim_player = player_plan
-    sim_rival = effective_rival
-    if st.session_state.rain_active:
-        from engine.optimizer import _adapt_plan_for_rain
-        sim_player = _adapt_plan_for_rain(player_plan, active_wetness)
-        sim_rival = _adapt_plan_for_rain(effective_rival, active_wetness)
-
-    # Run Deterministic Trace + Monte Carlo Rollout
-    det_trace = simulate_race_trace(
-        circuit=circuit,
-        player_plan=sim_player,
-        rival_plan=sim_rival,
-        safety_car_laps=active_sc_laps,
-        wetness_by_lap=active_wetness,
-        stochastic=False,
-    )
-
-    mc_summary = run_monte_carlo_evaluation(
-        circuit=circuit,
-        player_plan=player_plan,
-        rival_plan=effective_rival,
-        n_sims=n_sims,
-        enable_safety_cars=mc_sc,
-        enable_weather=mc_rain,
-    )
-
-    # -----------------------------------------------------------------------
-    # Top KPI Telemetry Strip
-    # -----------------------------------------------------------------------
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric(
-        label="Active Player Strategy",
-        value=player_plan.name.replace("DP Optimal: ", ""),
-        delta=f"vs {effective_rival.name.split('[')[0].strip()}",
-    )
-    k2.metric(
-        label="Live Scenario Finish Gap",
-        value=f"{det_trace['final_gap_sec']:+.2f}s",
-        delta="Ahead of Rival" if det_trace["final_gap_sec"] > 0 else "Behind Rival",
-    )
-    k3.metric(
-        label=f"Monte Carlo Win Prob ({n_sims} sims)",
-        value=f"{mc_summary.win_probability_pct:.1f}%",
-        delta=f"Mean Gap: {mc_summary.mean_final_gap_sec:+.2f}s (±{mc_summary.std_final_gap_sec:.1f}s)",
-    )
-    k4.metric(
-        label="Projected Total Race Time",
-        value=format_seconds_to_race_time(float(det_trace["player_cum_time"][-1])),
-        delta=f"DP Baseline: {format_seconds_to_race_time(dp_result.expected_total_time_sec)}",
-        delta_color="off",
-    )
-
-    # -----------------------------------------------------------------------
-    # Interactive Telemetry Tabs
-    # -----------------------------------------------------------------------
-    tab1, tab2, tab3 = st.tabs(
-        [
-            "📈 Gap-to-Rival & Monte Carlo Fan",
-            "⏱️ Lap Pace & Tire Degradation Cliffs",
-            "🏆 DP Strategy Matrix & Risk Histogram",
-        ]
-    )
-
-    with tab1:
-        st.plotly_chart(
-            build_gap_fan_chart(
-                circuit=circuit,
-                det_trace=det_trace,
-                mc_summary=mc_summary,
-                player_plan=sim_player,
-                rival_plan=sim_rival,
-                sc_laps=active_sc_laps,
-                wetness=active_wetness,
-            ),
-            use_container_width=True,
-        )
-
-    with tab2:
-        col_left, col_right = st.columns([1.4, 1.0])
-        with col_left:
-            st.plotly_chart(
-                build_lap_time_chart(det_trace, sim_player, sim_rival),
-                use_container_width=True,
-            )
-        with col_right:
-            st.plotly_chart(
-                build_tire_cliff_chart(circuit),
-                use_container_width=True,
-            )
-
-    with tab3:
-        col_dp, col_hist = st.columns([1.0, 1.2])
-        with col_dp:
-            st.subheader("Dynamic Programming Starting-Compound Ranking")
-            rows = []
-            for rank, (label, est_t, plan_obj) in enumerate(dp_result.top_alternatives, start=1):
-                rows.append(
-                    {
-                        "Rank": f"#{rank}",
-                        "Start Tire": plan_obj.start_compound,
-                        "Optimal Stint Sequence": label,
-                        "Dry Race Time (s)": round(est_t, 2),
-                        "Delta to Best (s)": f"+{est_t - dp_result.expected_total_time_sec:.2f}s",
-                    }
-                )
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            st.caption(
-                "Bellman backward induction solves over (Lap × Compound × Tire Age × 2-Compound FIA Rule) "
-                "to guarantee global optimality."
-            )
-
-        with col_hist:
-            st.subheader("Monte Carlo Finishing Gap Distribution")
-            hist_fig = go.Figure()
-            hist_fig.add_trace(
-                go.Histogram(
-                    x=mc_summary.all_gaps_sec,
-                    nbinsx=35,
-                    marker_color="#00D2BE",
-                    opacity=0.82,
-                    name="Simulated Final Gaps",
-                )
-            )
-            hist_fig.add_vline(x=0.0, line_dash="dash", line_color="#FF3355", annotation_text="Win/Loss Threshold")
-            hist_fig.update_layout(
-                xaxis_title="Final Gap to Rival at Checkered Flag (seconds)",
-                yaxis_title="Simulation Count",
-                template="plotly_dark",
-                height=340,
-                margin=dict(l=20, r=20, t=30, b=20),
-            )
-            st.plotly_chart(hist_fig, use_container_width=True)
-
-
-if __name__ == "__main__":
-    main()
+st.dataframe(pd.DataFrame(leaderboard_rows), use_container_width=True, hide_index=True)

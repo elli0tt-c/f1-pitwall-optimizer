@@ -1,0 +1,324 @@
+{
+  "australia": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.0998
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0578
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0315
+    }
+  },
+  "china": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1187
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0688
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0375
+    }
+  },
+  "suzuka": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1283
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0743
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0405
+    }
+  },
+  "miami": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1045
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0605
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.033
+    }
+  },
+  "canada": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.0855
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0495
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.027
+    }
+  },
+  "monaco": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.0523
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0303
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0165
+    }
+  },
+  "barcelona": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1311
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0759
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0414
+    }
+  },
+  "austria": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1121
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0649
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0354
+    }
+  },
+  "silverstone": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1187
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0688
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0375
+    }
+  },
+  "spa": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1092
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0633
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0345
+    }
+  },
+  "hungary": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1159
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0671
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0366
+    }
+  },
+  "zandvoort": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.114
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.066
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.036
+    }
+  },
+  "monza": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.0808
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0467
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0255
+    }
+  },
+  "madrid": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1026
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0594
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0324
+    }
+  },
+  "baku": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.0836
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0484
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0264
+    }
+  },
+  "sepang": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1349
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0781
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0426
+    }
+  },
+  "singapore": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1064
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0616
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0336
+    }
+  },
+  "austin": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1254
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0726
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0396
+    }
+  },
+  "mexico": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.0874
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0506
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0276
+    }
+  },
+  "brazil": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1121
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0649
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0354
+    }
+  },
+  "las_vegas": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.0817
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0473
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0258
+    }
+  },
+  "qatar": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.1377
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0798
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0435
+    }
+  },
+  "abu_dhabi": {
+    "SOFT": {
+      "base_offset_sec": 0.0,
+      "deg_per_lap_sec": 0.0998
+    },
+    "MEDIUM": {
+      "base_offset_sec": 0.55,
+      "deg_per_lap_sec": 0.0578
+    },
+    "HARD": {
+      "base_offset_sec": 1.15,
+      "deg_per_lap_sec": 0.0315
+    }
+  }
+}

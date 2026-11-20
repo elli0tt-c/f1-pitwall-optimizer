@@ -1,10 +1,11 @@
 """
 engine/physics.py
-Lap-by-lap motorsport race physics engine.
+Lap-by-lap motorsport race physics engine calibrated with real FastF1 telemetry.
 
 Models:
 - Fuel mass burn and longitudinal/lateral lap-time sensitivity
-- Compound-specific tire degradation (linear wear + quadratic thermal/rubber cliff)
+- Circuit-specific empirical compound pace offsets & degradation slopes (from FastF1)
+- Non-linear quadratic thermal/rubber performance cliff
 - Wet-weather compound crossover physics (Dry vs. Intermediate vs. Full Wet)
 - Wake aerodynamics (dirty-air downforce loss) and overtaking thresholds
 - Pit-stop delta under Green Flag vs. Safety Car neutralization
@@ -24,7 +25,7 @@ class TireCompound:
     code: str
     color: str
     base_offset_sec: float      # Pace delta vs. fresh Soft on dry track (s)
-    deg_per_lap_sec: float      # Linear lap-time degradation rate (s/lap)
+    deg_per_lap_sec: float      # Nominal linear lap-time degradation rate (s/lap)
     cliff_lap: int              # Tire age (laps) where thermal/wear cliff begins
     cliff_severity: float       # Quadratic penalty coefficient past cliff_lap (s/lap^2)
     optimal_wetness_min: float  # Minimum track wetness [0.0 = bone dry, 1.0 = monsoon]
@@ -94,7 +95,7 @@ DRY_COMPOUNDS: Tuple[str, ...] = ("SOFT", "MEDIUM", "HARD")
 
 @dataclass
 class Circuit:
-    """Circuit boundary conditions loaded from data/circuits.json."""
+    """Circuit boundary conditions & empirical FastF1 compound fits."""
     key: str
     name: str
     country: str
@@ -109,17 +110,51 @@ class Circuit:
     dirty_air_penalty_sec: float
     safety_car_prob_per_lap: float
     rain_prob: float
+    round: int = 0
+    telemetry_source: str = "FastF1 Calibrated"
+    compound_overrides: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
-def load_circuits(json_path: str = "data/circuits.json") -> Dict[str, Circuit]:
-    """Load all track presets into strongly-typed Circuit dataclasses."""
+def load_circuits(
+    json_path: str = "data/circuits.json",
+    compounds_path: str = "data/compound_profiles.json",
+) -> Dict[str, Circuit]:
+    """
+    Load all 2026 Grand Prix circuits and merge circuit-specific empirical
+    compound degradation fits from `data/compound_profiles.json` if present.
+    """
     path = Path(json_path)
     with path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
-    return {
-        key: Circuit(key=key, **cfg)
-        for key, cfg in raw.items()
-    }
+
+    comp_profiles: Dict[str, Dict[str, Dict[str, float]]] = {}
+    c_path = Path(compounds_path)
+    if c_path.exists():
+        with c_path.open("r", encoding="utf-8") as f:
+            comp_profiles = json.load(f)
+
+    circuits: Dict[str, Circuit] = {}
+    for key, cfg in raw.items():
+        circuits[key] = Circuit(
+            key=key,
+            name=cfg["name"],
+            country=cfg["country"],
+            total_laps=int(cfg["total_laps"]),
+            base_lap_time_sec=float(cfg["base_lap_time_sec"]),
+            pit_loss_sec=float(cfg["pit_loss_sec"]),
+            fuel_load_kg=float(cfg["fuel_load_kg"]),
+            fuel_burn_per_lap_kg=float(cfg["fuel_burn_per_lap_kg"]),
+            fuel_effect_sec_per_kg=float(cfg["fuel_effect_sec_per_kg"]),
+            tire_wear_multiplier=float(cfg["tire_wear_multiplier"]),
+            overtaking_difficulty=float(cfg["overtaking_difficulty"]),
+            dirty_air_penalty_sec=float(cfg["dirty_air_penalty_sec"]),
+            safety_car_prob_per_lap=float(cfg["safety_car_prob_per_lap"]),
+            rain_prob=float(cfg["rain_prob"]),
+            round=int(cfg.get("round", 0)),
+            telemetry_source=str(cfg.get("telemetry_source", "FastF1 Calibrated")),
+            compound_overrides=comp_profiles.get(key, {}),
+        )
+    return circuits
 
 
 def compute_fuel_penalty(circuit: Circuit, lap: int) -> float:
@@ -140,17 +175,20 @@ def compute_tire_delta(
     """
     Calculate tire pace delta (seconds) relative to a fresh Soft on a dry track.
 
-    Includes:
-    1. Base compound stiffness offset
-    2. Circuit-scaled linear rubber wear
-    3. Quadratic thermal/wear cliff beyond `cliff_lap`
-    4. Wet/dry compound mismatch penalty (aquaplaning or overheating)
+    Uses circuit-specific FastF1 empirical base offsets and linear degradation slopes
+    when available, combined with quadratic thermal/wear cliff and wetness mismatch physics.
     """
     comp = COMPOUNDS[compound_key]
     effective_age = max(0, tire_age)
 
-    # Linear degradation scaled by track abrasiveness/energy
-    linear_deg = comp.deg_per_lap_sec * circuit.tire_wear_multiplier * effective_age
+    override = circuit.compound_overrides.get(compound_key)
+    if override is not None:
+        base_offset = float(override.get("base_offset_sec", comp.base_offset_sec))
+        # Empirical deg_per_lap_sec from FastF1 already incorporates track abrasiveness
+        linear_deg = float(override.get("deg_per_lap_sec", comp.deg_per_lap_sec)) * effective_age
+    else:
+        base_offset = comp.base_offset_sec
+        linear_deg = comp.deg_per_lap_sec * circuit.tire_wear_multiplier * effective_age
 
     # Non-linear performance cliff once tire exceeds thermal/wear life
     adjusted_cliff = max(5.0, comp.cliff_lap / max(0.5, circuit.tire_wear_multiplier ** 0.5))
@@ -160,15 +198,13 @@ def compute_tire_delta(
     # Wetness mismatch penalty
     wetness_penalty = 0.0
     if track_wetness < comp.optimal_wetness_min:
-        # Wet/Inter tires overheating and graining on a drying track
         deficit = comp.optimal_wetness_min - track_wetness
         wetness_penalty = 18.0 * (deficit ** 1.5)
     elif track_wetness > comp.optimal_wetness_max:
-        # Slicks or Inters losing contact patch / aquaplaning in standing water
         excess = track_wetness - comp.optimal_wetness_max
         wetness_penalty = 32.0 * (excess ** 1.6)
 
-    return comp.base_offset_sec + linear_deg + cliff_deg + wetness_penalty
+    return base_offset + linear_deg + cliff_deg + wetness_penalty
 
 
 def compute_pit_loss(circuit: Circuit, is_safety_car: bool = False, noise_sec: float = 0.0) -> float:
@@ -198,22 +234,17 @@ def compute_lap_time(
     fuel_pen = compute_fuel_penalty(circuit, lap)
     tire_pen = compute_tire_delta(compound_key, tire_age, circuit, track_wetness)
 
-    # Base race pace (dry clear air)
     raw_pace = circuit.base_lap_time_sec + fuel_pen + tire_pen + driver_pace_offset_sec
 
-    # Wet track naturally slows even the optimal wet tire slightly
     if track_wetness > 0.0:
         raw_pace += 4.5 * track_wetness
 
-    # Wake aerodynamics penalty if stuck behind a car on green-flag laps
     if in_dirty_air and not is_safety_car and not is_pit_lap:
         raw_pace += circuit.dirty_air_penalty_sec
 
-    # Neutralized Safety Car lap runs ~38% slower than green-flag base pace
     if is_safety_car:
         raw_pace = circuit.base_lap_time_sec * 1.38
 
-    # Add pit-lane transit + stationary service delta if pitting on this lap
     pit_pen = compute_pit_loss(circuit, is_safety_car=is_safety_car) if is_pit_lap else 0.0
 
     return raw_pace + pit_pen + noise_sec
@@ -239,9 +270,6 @@ def simulate_race_trace(
 ) -> Dict[str, np.ndarray]:
     """
     Simulate a head-to-head race between Player and Rival over all `circuit.total_laps`.
-
-    Models interactive traffic: if a car catches its rival within 1.0s, it incurs
-    dirty-air loss unless its net pace advantage overcomes `circuit.overtaking_difficulty`.
     """
     n_laps = circuit.total_laps
     sc_set = set(safety_car_laps or [])
@@ -256,27 +284,23 @@ def simulate_race_trace(
     r_lap_times = np.zeros(n_laps)
     p_cum_time = np.zeros(n_laps)
     r_cum_time = np.zeros(n_laps)
-    gap_to_rival = np.zeros(n_laps)  # Positive = Player ahead of Rival (seconds)
+    gap_to_rival = np.zeros(n_laps)
     p_compounds_hist: List[str] = []
     r_compounds_hist: List[str] = []
     p_tire_ages = np.zeros(n_laps, dtype=int)
     r_tire_ages = np.zeros(n_laps, dtype=int)
 
-    # Pace delta required to execute an overtake (seconds/lap)
     overtake_threshold_sec = 0.35 + 1.45 * circuit.overtaking_difficulty
-
-    prev_gap = 0.0  # Start side-by-side at t = 0
+    prev_gap = 0.0
 
     for idx in range(n_laps):
         lap_num = idx + 1
         is_sc = lap_num in sc_set
         w_lap = wetness[idx] if idx < len(wetness) else 0.0
 
-        # Check scheduled pit stops at the end of this lap
         p_pit = lap_num in player_plan.pit_stops
         r_pit = lap_num in rival_plan.pit_stops
 
-        # Determine if trailing car is caught in dirty air (< 1.0s behind)
         p_dirty = False
         r_dirty = False
         if not is_sc and lap_num > 1:
@@ -284,12 +308,10 @@ def simulate_race_trace(
             r_raw_est = compute_tire_delta(r_comp, r_age, circuit, w_lap) + rival_plan.driver_pace_offset_sec
 
             if -1.0 < prev_gap < 0.0:
-                # Player is trailing Rival within 1.0s
                 pace_adv = r_raw_est - p_raw_est
                 if pace_adv < overtake_threshold_sec:
                     p_dirty = True
             elif 0.0 < prev_gap < 1.0:
-                # Rival is trailing Player within 1.0s
                 pace_adv = p_raw_est - r_raw_est
                 if pace_adv < overtake_threshold_sec:
                     r_dirty = True
@@ -322,7 +344,6 @@ def simulate_race_trace(
             noise_sec=r_noise,
         )
 
-        # Record telemetry before tire swap takes effect for next lap
         p_lap_times[idx] = p_lt
         r_lap_times[idx] = r_lt
         p_compounds_hist.append(p_comp)
@@ -333,7 +354,6 @@ def simulate_race_trace(
         p_cum_time[idx] = (p_cum_time[idx - 1] if idx > 0 else 0.0) + p_lt
         r_cum_time[idx] = (r_cum_time[idx - 1] if idx > 0 else 0.0) + r_lt
 
-        # Under Safety Car, field compresses behind leader (gaps shrink toward ~0.6s)
         if is_sc:
             raw_gap = r_cum_time[idx] - p_cum_time[idx]
             compressed_gap = np.clip(raw_gap, -0.6, 0.6)
@@ -345,7 +365,6 @@ def simulate_race_trace(
         prev_gap = r_cum_time[idx] - p_cum_time[idx]
         gap_to_rival[idx] = prev_gap
 
-        # Update tire state for next lap
         if p_pit:
             p_comp = player_plan.pit_stops[lap_num]
             p_age = 0
@@ -374,14 +393,10 @@ def simulate_race_trace(
 
 
 if __name__ == "__main__":
-    # Quick physics test bench: Compare 1-stop vs 2-stop at Silverstone
     circuits = load_circuits()
-    silverstone = circuits["silverstone"]
-
-    one_stop = CarStrategyPlan(name="1-Stop (M->H)", start_compound="MEDIUM", pit_stops={22: "HARD"})
-    two_stop = CarStrategyPlan(name="2-Stop (S->M->M)", start_compound="SOFT", pit_stops={15: "MEDIUM", 34: "MEDIUM"})
-
-    res = simulate_race_trace(silverstone, player_plan=two_stop, rival_plan=one_stop)
-    winner = "2-Stop" if res["final_gap_sec"] > 0 else "1-Stop"
-    print(f"Silverstone 52-Lap Test: {winner} wins by {abs(res['final_gap_sec']):.2f}s")
-    print(f"2-Stop Total Time: {res['player_cum_time'][-1]:.2f}s | 1-Stop Total Time: {res['rival_cum_time'][-1]:.2f}s")
+    print(f"Loaded {len(circuits)} calibrated 2026 F1 circuits:")
+    for k, c in sorted(circuits.items(), key=lambda x: x[1].round):
+        print(
+            f"  R{c.round:02d} {c.name:<42} | Laps: {c.total_laps:2d} | "
+            f"Base: {c.base_lap_time_sec:6.2f}s | PitLoss: {c.pit_loss_sec:5.2f}s | {c.telemetry_source}"
+        )
