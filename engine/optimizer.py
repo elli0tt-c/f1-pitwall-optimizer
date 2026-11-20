@@ -7,7 +7,9 @@ Combines:
    dry-weather pit window and compound sequence (enforcing the 2-compound FIA rule).
 2. Mid-Race Re-Solver: dynamically recomputes optimal remaining stints from any live
    race state (e.g., reacting instantaneously to a Safety Car or Rival Undercut).
-3. Monte Carlo Rollout Engine: stress-tests candidate strategies across hundreds of
+3. Custom Strategy Builder & Validator: constructs and validates user-defined pit-wall
+   strategies against FIA sporting regulations (2-compound rule & valid pit windows).
+4. Monte Carlo Rollout Engine: stress-tests candidate strategies across hundreds of
    stochastic race futures (random Safety Cars, rain showers, and lap-time variance).
 """
 
@@ -42,6 +44,87 @@ class DPOptimalResult:
     pit_laps: List[int]
     stint_summary: str
     top_alternatives: List[Tuple[str, float, CarStrategyPlan]]
+
+
+@dataclass
+class CustomStrategyResult:
+    """Validated user-constructed pit-wall strategy plan."""
+    plan: CarStrategyPlan
+    stint_summary: str
+    is_fia_legal_dry: bool
+    warnings: List[str]
+
+
+def build_custom_strategy_plan(
+    circuit: Circuit,
+    start_compound: str,
+    stops: List[Tuple[int, str]],
+    driver_pace_offset_sec: float = 0.0,
+) -> CustomStrategyResult:
+    """
+    Construct and validate a custom user-defined pit-wall strategy.
+
+    Args:
+        circuit: Active Grand Prix circuit configuration.
+        start_compound: Starting tire compound key (e.g., "SOFT", "MEDIUM", "HARD").
+        stops: List of (pit_lap, next_compound) tuples.
+        driver_pace_offset_sec: Driver/car pace delta vs. rival (s/lap).
+
+    Returns:
+        CustomStrategyResult containing the executable CarStrategyPlan, formatted
+        stint label, FIA 2-compound compliance boolean, and any validation warnings.
+    """
+    warnings: List[str] = []
+    n_laps = circuit.total_laps
+
+    if start_compound not in COMPOUNDS:
+        start_compound = "MEDIUM"
+        warnings.append("Invalid starting compound defaulted to MEDIUM.")
+
+    # Sort stops chronologically and clamp pit laps to valid race window [1, n_laps - 1]
+    cleaned_stops: Dict[int, str] = {}
+    seen_laps = set()
+    for raw_lap, comp in sorted(stops, key=lambda item: item[0]):
+        clamped_lap = max(1, min(n_laps - 1, int(raw_lap)))
+        if clamped_lap != raw_lap:
+            warnings.append(f"Pit lap {raw_lap} adjusted to valid race window (Lap {clamped_lap}).")
+        if clamped_lap in seen_laps:
+            warnings.append(f"Duplicate pit stop on Lap {clamped_lap} merged (last compound kept).")
+        seen_laps.add(clamped_lap)
+
+        valid_comp = comp if comp in COMPOUNDS else "HARD"
+        cleaned_stops[clamped_lap] = valid_comp
+
+    # Check FIA Sporting Regulation: at least 2 distinct dry compounds required in a dry race
+    compounds_used = [start_compound] + [cleaned_stops[l] for l in sorted(cleaned_stops)]
+    distinct_dry_used = {c for c in compounds_used if c in DRY_COMPOUNDS}
+    is_fia_legal_dry = len(distinct_dry_used) >= 2
+
+    if not is_fia_legal_dry:
+        warnings.append(
+            "FIA Regulation Warning: Fewer than 2 distinct dry compounds scheduled "
+            "(subject to post-race disqualification in dry conditions)."
+        )
+
+    stint_codes = [COMPOUNDS[c].code for c in compounds_used]
+    stint_label = f"{len(cleaned_stops)}-Stop ({'→'.join(stint_codes)})"
+    if cleaned_stops:
+        laps_str = ", ".join(f"L{l}" for l in sorted(cleaned_stops))
+        stint_label += f" [{laps_str}]"
+
+    plan = CarStrategyPlan(
+        name=f"Custom: {stint_label}",
+        start_compound=start_compound,
+        pit_stops=cleaned_stops,
+        driver_pace_offset_sec=driver_pace_offset_sec,
+    )
+
+    return CustomStrategyResult(
+        plan=plan,
+        stint_summary=stint_label,
+        is_fia_legal_dry=is_fia_legal_dry,
+        warnings=warnings,
+    )
 
 
 def _extract_trajectory_for_exact_stops(

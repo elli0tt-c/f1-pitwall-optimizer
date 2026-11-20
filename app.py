@@ -1,10 +1,11 @@
 """
 app.py
-F1 / Endurance Pit-Wall Strategy Simulator (v2.0 — 2026 Season FastF1 Telemetry Edition)
+F1 / Endurance Pit-Wall Strategy Simulator (v2.2 — 2026 Season FastF1 Telemetry Edition)
 
 Interactive Streamlit + Plotly pit-wall command center featuring:
 - All 23 circuits of the 2026 FIA Formula 1 World Championship calibrated via FastF1
 - Exact Backward Dynamic Programming (Bellman optimality) solver enforcing the 2-compound rule
+- Interactive Custom Pit-Wall Strategy Builder with FIA 2-compound rule validation & DP delta benchmarking
 - Live mid-race chaos controls (Safety Car deployment, Rival Undercut, Passing Rain Cell)
 - Monte Carlo stochastic race rollout engine with P10–P90 confidence fan chart
 - Circuit-specific empirical tire compound degradation & thermal cliff curves
@@ -16,6 +17,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from engine.optimizer import (
+    build_custom_strategy_plan,
     generate_standard_rival_strategies,
     run_monte_carlo_evaluation,
     solve_optimal_strategy_dp,
@@ -88,7 +90,7 @@ circuit = circuits[selected_key]
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("⚙️ Solver & Monte Carlo Settings")
-max_stops = st.sidebar.slider("Max Allowed Pit Stops", min_value=1, max_value=3, value=2)
+max_stops = st.sidebar.slider("DP Solver Max Allowed Pit Stops", min_value=1, max_value=3, value=2)
 driver_pace_offset = st.sidebar.slider(
     "Player Pace Delta vs. Rival (s/lap)",
     min_value=-0.40,
@@ -129,12 +131,91 @@ dp_result = solve_optimal_strategy_dp(
     driver_pace_offset_sec=driver_pace_offset,
 )
 rival_strategies = generate_standard_rival_strategies(circuit)
-rival_idx = st.selectbox(
-    "Select Primary Rival Strategy Benchmark",
-    options=list(range(len(rival_strategies))),
-    format_func=lambda i: rival_strategies[i].name,
-)
+
+ctrl_col1, ctrl_col2 = st.columns([1, 1])
+with ctrl_col1:
+    strategy_mode = st.radio(
+        "Player Pit-Wall Strategy Mode",
+        options=["🤖 Bellman DP Optimal (Auto)", "🛠️ Custom Pit-Wall Strategy (Manual)"],
+        horizontal=True,
+    )
+with ctrl_col2:
+    rival_idx = st.selectbox(
+        "Primary Rival Strategy Benchmark",
+        options=list(range(len(rival_strategies))),
+        format_func=lambda i: rival_strategies[i].name,
+    )
 rival_plan = rival_strategies[rival_idx]
+
+# --- CUSTOM STRATEGY BUILDER PANEL ---
+custom_result = None
+base_player_plan = dp_result.plan
+
+if strategy_mode == "🛠️ Custom Pit-Wall Strategy (Manual)":
+    with st.expander("🛠️ Custom Pit-Wall Strategy Designer", expanded=True):
+        b_col1, b_col2 = st.columns([1, 1])
+        with b_col1:
+            custom_start_comp = st.selectbox(
+                "Starting Tire Compound",
+                options=list(DRY_COMPOUNDS),
+                index=0,
+                format_func=lambda c: f"{COMPOUNDS[c].name} ({COMPOUNDS[c].code})",
+                key=f"custom_start_{selected_key}",
+            )
+        with b_col2:
+            custom_num_stops = st.number_input(
+                "Scheduled Pit Stops",
+                min_value=0,
+                max_value=3,
+                value=1,
+                step=1,
+                key=f"custom_stops_{selected_key}",
+            )
+
+        custom_stops_input = []
+        if custom_num_stops > 0:
+            stop_cols = st.columns(int(custom_num_stops))
+            for s_idx in range(int(custom_num_stops)):
+                default_lap = max(
+                    2,
+                    min(
+                        circuit.total_laps - 1,
+                        int(round(circuit.total_laps * (s_idx + 1) / (custom_num_stops + 1))),
+                    ),
+                )
+                default_comp_idx = 2 if (s_idx == custom_num_stops - 1 and custom_start_comp != "HARD") else 1
+                with stop_cols[s_idx]:
+                    st.markdown(f"**Pit Stop #{s_idx + 1}**")
+                    p_lap = st.number_input(
+                        f"Box on Lap (Stop {s_idx + 1})",
+                        min_value=1,
+                        max_value=circuit.total_laps - 1,
+                        value=default_lap,
+                        step=1,
+                        key=f"custom_lap_{selected_key}_{s_idx}",
+                    )
+                    p_comp = st.selectbox(
+                        f"Fit Compound (Stop {s_idx + 1})",
+                        options=list(DRY_COMPOUNDS),
+                        index=default_comp_idx,
+                        format_func=lambda c: f"{COMPOUNDS[c].name} ({COMPOUNDS[c].code})",
+                        key=f"custom_comp_{selected_key}_{s_idx}",
+                    )
+                    custom_stops_input.append((int(p_lap), p_comp))
+
+        custom_result = build_custom_strategy_plan(
+            circuit=circuit,
+            start_compound=custom_start_comp,
+            stops=custom_stops_input,
+            driver_pace_offset_sec=driver_pace_offset,
+        )
+        base_player_plan = custom_result.plan
+
+        if custom_result.is_fia_legal_dry:
+            st.success(f"✅ FIA 2-Compound Dry Rule Satisfied — Active Plan: **{custom_result.stint_summary}**")
+        else:
+            for w in custom_result.warnings:
+                st.warning(f"⚠️ {w}")
 
 # --- APPLY LIVE CHAOS SCENARIO ---
 sc_laps = list(range(chaos_lap, min(circuit.total_laps + 1, chaos_lap + 4))) if inject_sc else []
@@ -153,17 +234,16 @@ if inject_undercut:
         pit_stops={early_lap: "HARD"},
     )
 
-# Mid-race dynamic re-optimization if Safety Car is deployed at chaos_lap
-active_player_plan = dp_result.plan
-if inject_sc:
-    # Determine player's tire state entering chaos_lap
-    curr_comp = dp_result.plan.start_compound
+# Mid-race dynamic re-optimization if Safety Car is deployed at chaos_lap (Auto DP mode)
+active_player_plan = base_player_plan
+if inject_sc and strategy_mode == "🤖 Bellman DP Optimal (Auto)":
+    curr_comp = base_player_plan.start_compound
     curr_age = 0
     used_two = False
     kept_stops = {}
     for l in range(1, chaos_lap):
-        if l in dp_result.plan.pit_stops:
-            nxt = dp_result.plan.pit_stops[l]
+        if l in base_player_plan.pit_stops:
+            nxt = base_player_plan.pit_stops[l]
             if nxt != curr_comp:
                 used_two = True
             curr_comp = nxt
@@ -183,13 +263,13 @@ if inject_sc:
         driver_pace_offset_sec=driver_pace_offset,
     )
     merged_stops = {**kept_stops, **reopt.plan.pit_stops}
-    codes = [COMPOUNDS[dp_result.plan.start_compound].code] + [
+    codes = [COMPOUNDS[base_player_plan.start_compound].code] + [
         COMPOUNDS[merged_stops[l]].code for l in sorted(merged_stops)
     ]
     laps_label = ", ".join(f"L{l}" for l in sorted(merged_stops))
     active_player_plan = CarStrategyPlan(
         name=f"Live Re-Opt SC: {len(merged_stops)}-Stop ({'→'.join(codes)}) [{laps_label}]",
-        start_compound=dp_result.plan.start_compound,
+        start_compound=base_player_plan.start_compound,
         pit_stops=merged_stops,
         driver_pace_offset_sec=driver_pace_offset,
     )
@@ -203,6 +283,15 @@ det_trace = simulate_race_trace(
     wetness_by_lap=wetness_profile,
 )
 
+# Also compute clean dry baseline time for custom plan so we can benchmark directly vs. DP Optimal
+clean_player_trace = simulate_race_trace(
+    circuit=circuit,
+    player_plan=base_player_plan,
+    rival_plan=rival_plan,
+)
+clean_player_time_sec = float(clean_player_trace["player_cum_time"][-1])
+delta_vs_dp_sec = clean_player_time_sec - dp_result.expected_total_time_sec
+
 mc_summary = run_monte_carlo_evaluation(
     circuit=circuit,
     player_plan=active_player_plan,
@@ -214,10 +303,22 @@ mc_summary = run_monte_carlo_evaluation(
 
 # --- KPI METRIC STRIP ---
 k1, k2, k3, k4 = st.columns(4)
+clean_plan_label = (
+    active_player_plan.name
+    .replace("DP Optimal: ", "")
+    .replace("Live Re-Opt SC: ", "")
+    .replace("Custom: ", "Custom | ")
+)
+if strategy_mode == "🛠️ Custom Pit-Wall Strategy (Manual)":
+    k1_delta = f"{delta_vs_dp_sec:+.2f}s vs. DP Optimal"
+else:
+    k1_delta = "SC Re-Optimized" if inject_sc else "Bellman Global Optimum"
+
 k1.metric(
-    label="Optimal Pit-Wall Call",
-    value=active_player_plan.name.replace("DP Optimal: ", "").replace("Live Re-Opt SC: ", ""),
-    delta="SC Re-Optimized" if inject_sc else "Bellman Global Optimum",
+    label="Active Pit-Wall Strategy",
+    value=clean_plan_label,
+    delta=k1_delta,
+    delta_color="inverse" if (strategy_mode.startswith("🛠️") and delta_vs_dp_sec > 0.05) else "normal",
 )
 k2.metric(
     label="Projected Race Time",
@@ -319,18 +420,28 @@ with col_right:
     )
     st.plotly_chart(fig_tire, use_container_width=True)
 
-# --- ROW 2: DP STRATEGY LEADERBOARD & CIRCUIT TELEMETRY SUMMARY ---
-st.subheader("🏆 Dynamic Programming Strategy Leaderboard (2-Compound Rule Enforced)")
+# --- ROW 2: DP STRATEGY LEADERBOARD (+ CUSTOM BENCHMARK) ---
+st.subheader("🏆 Strategy Leaderboard & Custom Benchmark (Dry Baseline)")
+
+all_entries = [(label, total_sec, plan, "DP Optimal") for label, total_sec, plan in dp_result.top_alternatives]
+if custom_result is not None:
+    legal_tag = "Custom Strategy" if custom_result.is_fia_legal_dry else "Custom (⚠️ FIA 1-Comp)"
+    all_entries.append((custom_result.stint_summary, clean_player_time_sec, custom_result.plan, legal_tag))
+
+all_entries.sort(key=lambda item: item[1])
+fastest_time_sec = all_entries[0][1]
+
 leaderboard_rows = []
-for rank, (label, total_sec, plan) in enumerate(dp_result.top_alternatives, start=1):
-    delta_best = total_sec - dp_result.expected_total_time_sec
+for rank, (label, total_sec, plan, source_tag) in enumerate(all_entries, start=1):
+    delta_best = total_sec - fastest_time_sec
     leaderboard_rows.append(
         {
             "Rank": f"#{rank}",
+            "Source": source_tag,
             "Starting Compound": COMPOUNDS[plan.start_compound].name,
             "Strategy Sequence": label,
             "Total Race Time (s)": f"{total_sec:.2f}s",
-            "Delta vs. Optimal": "+0.00s" if rank == 1 else f"+{delta_best:.2f}s",
+            "Delta vs. Optimal": "+0.00s" if abs(delta_best) < 1e-3 else f"+{delta_best:.2f}s",
         }
     )
 
