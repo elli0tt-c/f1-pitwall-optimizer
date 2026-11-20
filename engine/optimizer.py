@@ -24,6 +24,15 @@ from engine.physics import (
     simulate_race_trace,
 )
 
+# Preference order for breaking mathematical commutativity ties (softer start = better launch grip)
+_COMPOUND_START_PRIORITY: Dict[str, int] = {
+    "SOFT": 0,
+    "MEDIUM": 1,
+    "HARD": 2,
+    "INTER": 3,
+    "WET": 4,
+}
+
 
 @dataclass
 class DPOptimalResult:
@@ -35,67 +44,37 @@ class DPOptimalResult:
     top_alternatives: List[Tuple[str, float, CarStrategyPlan]]
 
 
-def solve_optimal_strategy_dp(
-    circuit: Circuit,
-    start_lap: int = 1,
-    current_compound: Optional[str] = None,
-    current_tire_age: int = 0,
-    used_different_compound: bool = False,
-    is_safety_car_now: bool = False,
-    max_stops: int = 3,
-    driver_pace_offset_sec: float = 0.0,
-) -> DPOptimalResult:
+def _extract_trajectory_for_exact_stops(
+    comp_list: List[str],
+    lap_cost: np.ndarray,
+    start_lap: int,
+    n_laps: int,
+    remaining_laps: int,
+    max_age: int,
+    target_stops: int,
+    is_safety_car_now: bool,
+    pit_loss_sec: float,
+    start_choices: List[Tuple[int, int, int]],
+    driver_pace_offset_sec: float,
+) -> List[Tuple[str, float, CarStrategyPlan]]:
     """
-    Solve for the globally optimal pit-stop lap(s) and tire compound sequence from
-    `start_lap` to `circuit.total_laps` using exact Backward Dynamic Programming.
-
-    Enforces the sporting regulation requiring at least two distinct dry compounds
-    during a dry race.
+    Solve Backward DP constrained to finish with `target_stops` total pit stops
+    and extract the optimal trajectory for each valid starting compound.
     """
-    n_laps = circuit.total_laps
-    remaining_laps = n_laps - start_lap + 1
-    comp_list = list(DRY_COMPOUNDS)
     n_comp = len(comp_list)
-    max_age = n_laps + 1
-
-    # Precompute single-lap costs: lap_cost[lap_idx, comp_idx, age]
-    # Note: lap_idx is 0-indexed (0 -> Lap 1)
-    lap_cost = np.full((n_laps, n_comp, max_age), np.inf, dtype=np.float64)
-    for l_idx in range(start_lap - 1, n_laps):
-        lap_num = l_idx + 1
-        sc_flag = is_safety_car_now and (lap_num == start_lap)
-        for c_idx, c_name in enumerate(comp_list):
-            max_feasible_age = l_idx + current_tire_age + 1
-            for age in range(min(max_age, max_feasible_age + 1)):
-                lap_cost[l_idx, c_idx, age] = compute_lap_time(
-                    circuit=circuit,
-                    lap=lap_num,
-                    compound_key=c_name,
-                    tire_age=age,
-                    is_pit_lap=False,
-                    is_safety_car=sc_flag,
-                    track_wetness=0.0,
-                    in_dirty_air=False,
-                    driver_pace_offset_sec=driver_pace_offset_sec,
-                )
-
-    # DP value table: V[step, comp_idx, age, used_two_comps, stops_used]
-    # step goes from 0 (start_lap) to remaining_laps (finish)
     INF = 1e12
-    V = np.full((remaining_laps + 1, n_comp, max_age, 2, max_stops + 1), INF, dtype=np.float64)
 
-    # Policy backpointers: action = -1 (stay out) or c_next in {0, 1, 2} (pit to c_next)
-    policy = np.full((remaining_laps, n_comp, max_age, 2, max_stops + 1), -2, dtype=np.int8)
+    V = np.full((remaining_laps + 1, n_comp, max_age, 2, target_stops + 1), INF, dtype=np.float64)
+    policy = np.full((remaining_laps, n_comp, max_age, 2, target_stops + 1), -2, dtype=np.int8)
 
-    # Terminal boundary condition at checkered flag: must have used >= 2 dry compounds
-    V[remaining_laps, :, :, 1, :] = 0.0
+    # Terminal condition: checkered flag reached with >= 2 dry compounds AND exact target_stops
+    V[remaining_laps, :, :, 1, target_stops] = 0.0
 
-    # Backward induction from final lap back to start_lap
     for step in range(remaining_laps - 1, -1, -1):
         lap_num = start_lap + step
         l_idx = lap_num - 1
         sc_flag = is_safety_car_now and (lap_num == start_lap)
-        pit_delta = circuit.pit_loss_sec * (0.55 if sc_flag else 1.0)
+        pit_delta = pit_loss_sec * (0.55 if sc_flag else 1.0)
 
         for c_idx in range(n_comp):
             for age in range(max_age - 1):
@@ -104,13 +83,13 @@ def solve_optimal_strategy_dp(
                     continue
 
                 for used_two in (0, 1):
-                    for stops in range(max_stops + 1):
+                    for stops in range(target_stops + 1):
                         # Option A: Stay out on current tires
                         best_val = base_t + V[step + 1, c_idx, age + 1, used_two, stops]
                         best_act = -1
 
                         # Option B: Pit at end of this lap (not allowed on final lap)
-                        if lap_num < n_laps and stops < max_stops:
+                        if lap_num < n_laps and stops < target_stops:
                             for c_next in range(n_comp):
                                 next_used_two = 1 if (used_two == 1 or c_next != c_idx) else 0
                                 cand_val = base_t + pit_delta + V[step + 1, c_next, 0, next_used_two, stops + 1]
@@ -121,21 +100,12 @@ def solve_optimal_strategy_dp(
                         V[step, c_idx, age, used_two, stops] = best_val
                         policy[step, c_idx, age, used_two, stops] = best_act
 
-    # Evaluate starting compound choices if solving from Lap 1
-    candidates: List[Tuple[str, float, CarStrategyPlan]] = []
-
-    start_choices = (
-        [(comp_list.index(current_compound), current_tire_age, 1 if used_different_compound else 0)]
-        if current_compound is not None
-        else [(c_i, 0, 0) for c_i in range(n_comp)]
-    )
-
+    extracted: List[Tuple[str, float, CarStrategyPlan]] = []
     for c_start_idx, init_age, init_used in start_choices:
         total_t = V[0, c_start_idx, init_age, init_used, 0]
         if total_t >= INF:
             continue
 
-        # Reconstruct optimal trajectory forward
         c_curr = c_start_idx
         age_curr = init_age
         used_curr = init_used
@@ -168,17 +138,111 @@ def solve_optimal_strategy_dp(
             pit_stops=pit_stops,
             driver_pace_offset_sec=driver_pace_offset_sec,
         )
-        candidates.append((stint_label, float(total_t), plan))
+        extracted.append((stint_label, float(total_t), plan))
 
-    candidates.sort(key=lambda x: x[1])
-    best_label, best_time, best_plan = candidates[0]
+    return extracted
+
+
+def solve_optimal_strategy_dp(
+    circuit: Circuit,
+    start_lap: int = 1,
+    current_compound: Optional[str] = None,
+    current_tire_age: int = 0,
+    used_different_compound: bool = False,
+    is_safety_car_now: bool = False,
+    max_stops: int = 3,
+    driver_pace_offset_sec: float = 0.0,
+) -> DPOptimalResult:
+    """
+    Solve for the globally optimal pit-stop lap(s) and tire compound sequence from
+    `start_lap` to `circuit.total_laps` using exact Backward Dynamic Programming.
+
+    Enforces the sporting regulation requiring at least two distinct dry compounds
+    during a dry race, and deduplicates mathematically commutative stint permutations
+    (e.g., M→H vs. H→M) in favor of the softer-start race-launch sequence.
+    """
+    n_laps = circuit.total_laps
+    remaining_laps = n_laps - start_lap + 1
+    comp_list = list(DRY_COMPOUNDS)
+    n_comp = len(comp_list)
+    max_age = n_laps + 1
+
+    # Precompute single-lap costs: lap_cost[lap_idx, comp_idx, age]
+    lap_cost = np.full((n_laps, n_comp, max_age), np.inf, dtype=np.float64)
+    for l_idx in range(start_lap - 1, n_laps):
+        lap_num = l_idx + 1
+        sc_flag = is_safety_car_now and (lap_num == start_lap)
+        for c_idx, c_name in enumerate(comp_list):
+            max_feasible_age = l_idx + current_tire_age + 1
+            for age in range(min(max_age, max_feasible_age + 1)):
+                lap_cost[l_idx, c_idx, age] = compute_lap_time(
+                    circuit=circuit,
+                    lap=lap_num,
+                    compound_key=c_name,
+                    tire_age=age,
+                    is_pit_lap=False,
+                    is_safety_car=sc_flag,
+                    track_wetness=0.0,
+                    in_dirty_air=False,
+                    driver_pace_offset_sec=driver_pace_offset_sec,
+                )
+
+    start_choices = (
+        [(comp_list.index(current_compound), current_tire_age, 1 if used_different_compound else 0)]
+        if current_compound is not None
+        else [(c_i, 0, 0) for c_i in range(n_comp)]
+    )
+
+    min_stops = 0 if (current_compound is not None and used_different_compound) else 1
+    raw_candidates: List[Tuple[str, float, CarStrategyPlan]] = []
+
+    for stops_target in range(min_stops, max_stops + 1):
+        raw_candidates.extend(
+            _extract_trajectory_for_exact_stops(
+                comp_list=comp_list,
+                lap_cost=lap_cost,
+                start_lap=start_lap,
+                n_laps=n_laps,
+                remaining_laps=remaining_laps,
+                max_age=max_age,
+                target_stops=stops_target,
+                is_safety_car_now=is_safety_car_now,
+                pit_loss_sec=circuit.pit_loss_sec,
+                start_choices=start_choices,
+                driver_pace_offset_sec=driver_pace_offset_sec,
+            )
+        )
+
+    # Sort primarily by total race time, secondarily by softer starting compound
+    raw_candidates.sort(
+        key=lambda x: (round(x[1], 6), _COMPOUND_START_PRIORITY.get(x[2].start_compound, 99))
+    )
+
+    # Deduplicate commutative mirror strategies (e.g. M→H and H→M with identical race time)
+    deduped_candidates: List[Tuple[str, float, CarStrategyPlan]] = []
+    seen_canonical_sets: Dict[Tuple[int, Tuple[str, ...]], float] = {}
+
+    for label, total_t, plan in raw_candidates:
+        used_seq = [plan.start_compound] + [plan.pit_stops[l] for l in sorted(plan.pit_stops)]
+        canonical_key = (len(plan.pit_stops), tuple(sorted(used_seq)))
+
+        if canonical_key in seen_canonical_sets:
+            # Skip commutative mirror duplicates that have the exact same total time
+            if abs(total_t - seen_canonical_sets[canonical_key]) < 1e-4:
+                continue
+        else:
+            seen_canonical_sets[canonical_key] = total_t
+
+        deduped_candidates.append((label, total_t, plan))
+
+    best_label, best_time, best_plan = deduped_candidates[0]
 
     return DPOptimalResult(
         plan=best_plan,
         expected_total_time_sec=best_time,
         pit_laps=sorted(best_plan.pit_stops.keys()),
         stint_summary=best_label,
-        top_alternatives=candidates,
+        top_alternatives=deduped_candidates,
     )
 
 
