@@ -1,5 +1,7 @@
 # 🏎️ F1 / Endurance Pit-Wall Strategy Simulator (v2.4 — 2026 Season Edition)
 
+![view](/Users/elliottparker/Library/CloudStorage/OneDrive-Personal/Documents/Projects/f1-pitwall-optimizer/f1-pitwall-optimizer/view.png)
+
 An interactive motorsport race-strategy optimizer, real-race telemetry benchmarker, and stochastic pit-wall decision engine built in Python. Combines **dual-source OpenF1 & FastF1 telemetry calibration** across all **23 circuits of the 2026 FIA Formula 1 World Championship** with **exact Backward Dynamic Programming (Bellman optimality)** and **Monte Carlo stochastic race simulations**.
 
 🌐 **Live Interactive App:** [Launch Pit-Wall Simulator on Streamlit Cloud](https://f1-pitwall-optimizer.streamlit.app)
@@ -54,7 +56,7 @@ f1-pitwall-optimizer/
 🚀 Quickstart (Local Setup)
 
 1. Clone & Create Virtual Environment
-git clone [https://github.com/](https://github.com/)<your-username>/f1-pitwall-optimizer.git
+git clone [https://github.com/](https://github.com/)elli0tt-c/f1-pitwall-optimizer.git
 cd f1-pitwall-optimizer
 python3 -m venv venv
 source venv/bin/activate
